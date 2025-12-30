@@ -47,6 +47,7 @@ typedef struct {
   char project_name[MAX_NAME_LENGTH];
   WandbMetric metrics[MAX_METRICS_PER_RUN];
   uint8_t num_metrics;
+  bool running;
 } WandbRun;
 
 // App data (persistent)
@@ -148,6 +149,27 @@ static int32_t lerp_fixed(int32_t from, int32_t to, AnimationProgress progress) 
   return from + (int32_t)(((int64_t)progress * (to - from)) / ANIMATION_NORMALIZED_MAX);
 }
 
+// Menu section helpers - section 0 = Running, section 1 = Idle
+static uint8_t count_runs_by_state(bool running) {
+  uint8_t count = 0;
+  for (int i = 0; i < s_data.num_runs; i++) {
+    if (s_data.runs[i].running == running) count++;
+  }
+  return count;
+}
+
+static int8_t get_run_index_for_section_row(uint16_t section, uint16_t row) {
+  bool want_running = (section == 0);
+  uint8_t found = 0;
+  for (int i = 0; i < s_data.num_runs; i++) {
+    if (s_data.runs[i].running == want_running) {
+      if (found == row) return i;
+      found++;
+    }
+  }
+  return -1;
+}
+
 //==============================================================================
 // Mock Data Initialization
 //==============================================================================
@@ -172,11 +194,12 @@ static void init_mock_data(void) {
   // "0.9523" → 9523, "50" → 500000, "12.45" → 124500
   s_data.num_runs = 3;
 
-  // Run 1: sunny-moon-42 / image-classifier
+  // Run 1: sunny-moon-42 / image-classifier (running)
   WandbRun *run1 = &s_data.runs[0];
   strncpy(run1->run_name, "sunny-moon-42", MAX_NAME_LENGTH);
   strncpy(run1->project_name, "image-classifier", MAX_NAME_LENGTH);
   run1->num_metrics = 4;
+  run1->running = true;
 
   int32_t acc_hist[] = {5000, 6500, 7200, 7800, 8200, 8500, 8800, 9000, 9200, 9350, 9450, 9523};
   INIT_METRIC(&run1->metrics[0], "accuracy", "0.9523", acc_hist);
@@ -190,11 +213,12 @@ static void init_mock_data(void) {
   int32_t lr_hist[] = {10, 10, 10, 5, 5, 5, 2, 2, 1, 1};
   INIT_METRIC(&run1->metrics[3], "lr", "0.0001", lr_hist);
 
-  // Run 2: cosmic-river-7 / text-gen
+  // Run 2: cosmic-river-7 / text-gen (running)
   WandbRun *run2 = &s_data.runs[1];
   strncpy(run2->run_name, "cosmic-river-7", MAX_NAME_LENGTH);
   strncpy(run2->project_name, "text-gen", MAX_NAME_LENGTH);
   run2->num_metrics = 4;
+  run2->running = true;
 
   int32_t ppl_hist[] = {4500000, 3200000, 2200000, 1500000, 1000000, 700000, 500000, 350000, 250000, 180000, 150000, 124500};
   INIT_METRIC(&run2->metrics[0], "perplexity", "12.45", ppl_hist);
@@ -208,11 +232,12 @@ static void init_mock_data(void) {
   int32_t loss2_hist[] = {95000, 72000, 58000, 45000, 38000, 32000, 29000, 26500, 25000, 24000, 23410};
   INIT_METRIC(&run2->metrics[3], "loss", "2.341", loss2_hist);
 
-  // Run 3: rapid-forest-99 / rl-agent
+  // Run 3: rapid-forest-99 / rl-agent (idle)
   WandbRun *run3 = &s_data.runs[2];
   strncpy(run3->run_name, "rapid-forest-99", MAX_NAME_LENGTH);
   strncpy(run3->project_name, "rl-agent", MAX_NAME_LENGTH);
   run3->num_metrics = 4;
+  run3->running = false;
 
   int32_t reward_hist[] = {-50000, 20000, 80000, 150000, 200000, 250000, 300000, 350000, 400000, 430000, 460000, 487200};
   INIT_METRIC(&run3->metrics[0], "reward", "48.72", reward_hist);
@@ -1006,20 +1031,38 @@ static void detail_window_push(void) {
 //==============================================================================
 
 static uint16_t menu_get_num_sections_callback(MenuLayer *menu_layer, void *data) {
-  return 1;
+  return 2;
 }
 
 static uint16_t menu_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) {
-  return s_data.num_runs;
+  return (section_index == 0) ? count_runs_by_state(true) : count_runs_by_state(false);
+}
+
+static int16_t menu_get_header_height_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) {
+  uint8_t count = (section_index == 0) ? count_runs_by_state(true) : count_runs_by_state(false);
+  return (count > 0) ? 18 : 0;  // 14px text + 2px padding top + 2px padding bottom
+}
+
+static void menu_draw_header_callback(GContext *ctx, const Layer *cell_layer, uint16_t section_index, void *data) {
+  const char *title = (section_index == 0) ? "RUNNING" : "IDLE";
+  GRect bounds = layer_get_bounds(cell_layer);
+  GRect text_bounds = GRect(4, 0, bounds.size.w - 8, bounds.size.h);
+  graphics_context_set_text_color(ctx, GColorBlack);
+  graphics_draw_text(ctx, title, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                     text_bounds, GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
 static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_index, void *data) {
-  WandbRun *run = &s_data.runs[cell_index->row];
-  menu_cell_basic_draw(ctx, cell_layer, run->run_name, run->project_name, NULL);
+  int8_t run_index = get_run_index_for_section_row(cell_index->section, cell_index->row);
+  if (run_index < 0) return;
+  WandbRun *run = &s_data.runs[run_index];
+  menu_cell_basic_draw(ctx, cell_layer, run->run_name, NULL, NULL);
 }
 
 static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
-  s_ui.selected_run_index = cell_index->row;
+  int8_t run_index = get_run_index_for_section_row(cell_index->section, cell_index->row);
+  if (run_index < 0) return;
+  s_ui.selected_run_index = run_index;
   s_ui.current_metric_page = 0;
   detail_window_push();
 }
@@ -1034,6 +1077,8 @@ static void main_window_load(Window *window) {
   menu_layer_set_callbacks(s_main.menu, NULL, (MenuLayerCallbacks) {
     .get_num_sections = menu_get_num_sections_callback,
     .get_num_rows = menu_get_num_rows_callback,
+    .get_header_height = menu_get_header_height_callback,
+    .draw_header = menu_draw_header_callback,
     .draw_row = menu_draw_row_callback,
     .select_click = menu_select_callback,
   });
