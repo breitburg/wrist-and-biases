@@ -60,6 +60,7 @@ typedef struct {
   uint8_t selected_run_index;
   uint8_t current_metric_page;
   uint8_t graph_display_page;
+  bool loading;
 } UIState;
 
 // Main window state
@@ -67,6 +68,8 @@ typedef struct {
   Window *window;
   MenuLayer *menu;
   StatusBarLayer *status_bar;
+  TextLayer *loading_layer;
+  bool loading;
 } MainWindowState;
 
 // Detail window state
@@ -76,6 +79,7 @@ typedef struct {
   TextLayer *name_layer;
   Layer *graph_layer;
   Layer *action_button_layer;
+  Layer *skeleton_layer;
   StatusBarLayer *status_bar;
   TextLayer *pagination_layer;
   GRect value_frame;
@@ -258,6 +262,33 @@ static void update_detail_text(void) {
 }
 
 //==============================================================================
+// Detail Window - Skeleton Loading State
+//==============================================================================
+
+static void skeleton_layer_update_proc(Layer *layer, GContext *ctx) {
+  if (!s_ui.loading) return;
+
+  graphics_context_set_fill_color(ctx, GColorLightGray);
+
+  // Draw skeleton rectangle for name (slightly smaller than frame)
+  GRect name_skeleton = s_detail.name_frame;
+  name_skeleton.size.w = 80;
+  name_skeleton.size.h = 14;
+  name_skeleton.origin.y += 4;
+  graphics_fill_rect(ctx, name_skeleton, 0, GCornerNone);
+
+  // Draw skeleton rectangle for value (larger rectangle)
+  GRect value_skeleton = s_detail.value_frame;
+  value_skeleton.size.w = 100;
+  value_skeleton.size.h = 26;
+  value_skeleton.origin.y += 3;
+  graphics_fill_rect(ctx, value_skeleton, 0, GCornerNone);
+
+  // Draw skeleton rectangle for graph area
+  graphics_fill_rect(ctx, s_detail.graph_frame, 0, GCornerNone);
+}
+
+//==============================================================================
 // Detail Window - Graph Drawing
 //==============================================================================
 
@@ -339,6 +370,8 @@ static void draw_indicator(GContext *ctx, GPoint position) {
 }
 
 static void graph_layer_update_proc(Layer *layer, GContext *ctx) {
+  if (s_ui.loading) return;
+
   GRect bounds = layer_get_bounds(layer);
   WandbMetric *metric = &s_data.runs[s_ui.selected_run_index].metrics[s_ui.graph_display_page];
 
@@ -367,6 +400,8 @@ static void graph_layer_update_proc(Layer *layer, GContext *ctx) {
 //==============================================================================
 
 static void action_button_layer_update_proc(Layer *layer, GContext *ctx) {
+  if (s_ui.loading) return;
+
   GRect bounds = layer_get_bounds(layer);
 
   // Draw semi-circle on right edge (similar to firmware implementation)
@@ -810,6 +845,8 @@ static void stop_scrub_repeat(void) {
 }
 
 static void detail_up_down_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_ui.loading) return;
+
   ButtonId button = click_recognizer_get_button_id(recognizer);
   int direction = (button == BUTTON_ID_UP) ? 1 : -1;
 
@@ -830,6 +867,8 @@ static void detail_up_down_release_handler(ClickRecognizerRef recognizer, void *
 }
 
 static void detail_select_click_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_ui.loading) return;
+
   if (s_scrub.active) {
     exit_scrub_mode();
   } else {
@@ -890,7 +929,7 @@ static void detail_window_load(Window *window) {
   #endif
 
   const int16_t value_y = name_y + 22;
-  const int16_t graph_y = value_y + 32 + PADDING_LEFT * 2;
+  const int16_t graph_y = value_y + 32 + padding;
   const int16_t graph_height = bounds.size.h - graph_y - padding;
 
   // Store frames for animation
@@ -923,15 +962,24 @@ static void detail_window_load(Window *window) {
   layer_set_update_proc(s_detail.action_button_layer, action_button_layer_update_proc);
   layer_add_child(window_layer, s_detail.action_button_layer);
 
+  // Skeleton layer (drawn on top when loading)
+  s_detail.skeleton_layer = layer_create(bounds);
+  layer_set_update_proc(s_detail.skeleton_layer, skeleton_layer_update_proc);
+  layer_add_child(window_layer, s_detail.skeleton_layer);
+
   // Reset state
   s_detail.scroll_animation = NULL;
   s_scrub.active = false;
 
-  update_detail_text();
+  // Don't call update_detail_text() when loading - skeleton shows instead
+  if (!s_ui.loading) {
+    update_detail_text();
+  }
 }
 
 static void detail_window_unload(Window *window) {
   s_scrub.active = false;
+  s_ui.loading = false;
 
   if (s_detail.scroll_animation) {
     animation_unschedule(s_detail.scroll_animation);
@@ -941,6 +989,7 @@ static void detail_window_unload(Window *window) {
   text_layer_destroy(s_detail.name_layer);
   layer_destroy(s_detail.graph_layer);
   layer_destroy(s_detail.action_button_layer);
+  layer_destroy(s_detail.skeleton_layer);
   #if !defined(PBL_ROUND)
     text_layer_destroy(s_detail.pagination_layer);
   #endif
@@ -950,6 +999,8 @@ static void detail_window_unload(Window *window) {
 }
 
 static void detail_window_push(void) {
+  s_ui.loading = true;
+
   s_detail.window = window_create();
   window_set_click_config_provider(s_detail.window, detail_click_config_provider);
   window_set_window_handlers(s_detail.window, (WindowHandlers) {
@@ -957,6 +1008,14 @@ static void detail_window_push(void) {
     .unload = detail_window_unload,
   });
   window_stack_push(s_detail.window, true);
+}
+
+static void detail_mark_loaded(void) {
+  if (!s_ui.loading) return;
+
+  s_ui.loading = false;
+  update_detail_text();
+  layer_mark_dirty(s_detail.skeleton_layer);
 }
 
 //==============================================================================
@@ -1005,12 +1064,34 @@ static void main_window_load(Window *window) {
 
   layer_add_child(window_layer, menu_layer_get_layer(s_main.menu));
 
+  // Loading text layer
+  GRect loading_bounds = GRect(PADDING_LEFT, STATUS_BAR_HEIGHT + PADDING_LEFT,
+                                bounds.size.w - PADDING_LEFT * 2, bounds.size.h - STATUS_BAR_HEIGHT);
+  s_main.loading_layer = text_layer_create(loading_bounds);
+  text_layer_set_font(s_main.loading_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_text(s_main.loading_layer, "Talking with Weights & Biases...");
+  text_layer_set_background_color(s_main.loading_layer, GColorWhite);
+  layer_add_child(window_layer, text_layer_get_layer(s_main.loading_layer));
+
+  // Show/hide layers based on loading state
+  layer_set_hidden(menu_layer_get_layer(s_main.menu), s_main.loading);
+  layer_set_hidden(text_layer_get_layer(s_main.loading_layer), !s_main.loading);
+
   s_main.status_bar = create_status_bar(window_layer);
 }
 
 static void main_window_unload(Window *window) {
   menu_layer_destroy(s_main.menu);
+  text_layer_destroy(s_main.loading_layer);
   status_bar_layer_destroy(s_main.status_bar);
+}
+
+static void main_mark_loaded(void) {
+  if (!s_main.loading) return;
+
+  s_main.loading = false;
+  layer_set_hidden(menu_layer_get_layer(s_main.menu), false);
+  layer_set_hidden(text_layer_get_layer(s_main.loading_layer), true);
 }
 
 //==============================================================================
@@ -1020,6 +1101,7 @@ static void main_window_unload(Window *window) {
 static void prv_init(void) {
   init_mock_data();
 
+  s_main.loading = true;
   s_main.window = window_create();
   window_set_window_handlers(s_main.window, (WindowHandlers) {
     .load = main_window_load,
