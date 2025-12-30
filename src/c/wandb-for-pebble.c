@@ -69,6 +69,7 @@ typedef struct {
   MenuLayer *menu;
   StatusBarLayer *status_bar;
   TextLayer *loading_layer;
+  AppTimer *loading_timer;
   bool loading;
 } MainWindowState;
 
@@ -78,10 +79,10 @@ typedef struct {
   TextLayer *value_layer;
   TextLayer *name_layer;
   Layer *graph_layer;
-  Layer *action_button_layer;
   Layer *skeleton_layer;
   StatusBarLayer *status_bar;
   TextLayer *pagination_layer;
+  AppTimer *loading_timer;
   GRect value_frame;
   GRect name_frame;
   GRect graph_frame;
@@ -393,24 +394,6 @@ static void graph_layer_update_proc(Layer *layer, GContext *ctx) {
     : points[metric->history_count - 1];
 
   draw_indicator(ctx, indicator);
-}
-
-//==============================================================================
-// Detail Window - Action Button Drawing
-//==============================================================================
-
-static void action_button_layer_update_proc(Layer *layer, GContext *ctx) {
-  if (s_ui.loading) return;
-
-  GRect bounds = layer_get_bounds(layer);
-
-  // Draw semi-circle on right edge (similar to firmware implementation)
-  int16_t radius = 12;
-  int16_t center_x = bounds.size.w + radius / 2;  // Partially off-screen
-  int16_t center_y = bounds.size.h / 2;
-
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_circle(ctx, GPoint(center_x, center_y), radius);
 }
 
 //==============================================================================
@@ -788,7 +771,6 @@ static void enter_scrub_mode(void) {
   update_scrub_value_display_interpolated(s_scrub.current_index_fixed);
   update_scrub_name_display();
   mark_graph_dirty();
-  layer_mark_dirty(s_detail.action_button_layer);
 
   s_scrub.wiggle_start = s_scrub.current_index_fixed;
   s_scrub.wiggle_amount = SCRUB_FIXED_SCALE;
@@ -806,7 +788,6 @@ static void exit_scrub_animation_teardown(Animation *animation) {
   text_layer_set_text(s_detail.name_layer, s_name_buffer);
 
   mark_graph_dirty();
-  layer_mark_dirty(s_detail.action_button_layer);
 }
 
 static const AnimationImplementation s_exit_scrub_animation_impl = {
@@ -957,11 +938,6 @@ static void detail_window_load(Window *window) {
   layer_set_clips(s_detail.graph_layer, false);
   layer_add_child(window_layer, s_detail.graph_layer);
 
-  // Action button layer
-  s_detail.action_button_layer = layer_create(bounds);
-  layer_set_update_proc(s_detail.action_button_layer, action_button_layer_update_proc);
-  layer_add_child(window_layer, s_detail.action_button_layer);
-
   // Skeleton layer (drawn on top when loading)
   s_detail.skeleton_layer = layer_create(bounds);
   layer_set_update_proc(s_detail.skeleton_layer, skeleton_layer_update_proc);
@@ -981,6 +957,10 @@ static void detail_window_unload(Window *window) {
   s_scrub.active = false;
   s_ui.loading = false;
 
+  if (s_detail.loading_timer) {
+    app_timer_cancel(s_detail.loading_timer);
+    s_detail.loading_timer = NULL;
+  }
   if (s_detail.scroll_animation) {
     animation_unschedule(s_detail.scroll_animation);
     s_detail.scroll_animation = NULL;
@@ -988,7 +968,6 @@ static void detail_window_unload(Window *window) {
   text_layer_destroy(s_detail.value_layer);
   text_layer_destroy(s_detail.name_layer);
   layer_destroy(s_detail.graph_layer);
-  layer_destroy(s_detail.action_button_layer);
   layer_destroy(s_detail.skeleton_layer);
   #if !defined(PBL_ROUND)
     text_layer_destroy(s_detail.pagination_layer);
@@ -996,6 +975,15 @@ static void detail_window_unload(Window *window) {
   status_bar_layer_destroy(s_detail.status_bar);
   window_destroy(s_detail.window);
   s_detail.window = NULL;
+}
+
+static void detail_loading_timer_callback(void *data) {
+  s_detail.loading_timer = NULL;
+  if (!s_ui.loading) return;
+
+  s_ui.loading = false;
+  update_detail_text();
+  layer_mark_dirty(s_detail.skeleton_layer);
 }
 
 static void detail_window_push(void) {
@@ -1008,14 +996,9 @@ static void detail_window_push(void) {
     .unload = detail_window_unload,
   });
   window_stack_push(s_detail.window, true);
-}
 
-static void detail_mark_loaded(void) {
-  if (!s_ui.loading) return;
-
-  s_ui.loading = false;
-  update_detail_text();
-  layer_mark_dirty(s_detail.skeleton_layer);
+  // Schedule loading timer (1 second)
+  s_detail.loading_timer = app_timer_register(1000, detail_loading_timer_callback, NULL);
 }
 
 //==============================================================================
@@ -1081,12 +1064,17 @@ static void main_window_load(Window *window) {
 }
 
 static void main_window_unload(Window *window) {
+  if (s_main.loading_timer) {
+    app_timer_cancel(s_main.loading_timer);
+    s_main.loading_timer = NULL;
+  }
   menu_layer_destroy(s_main.menu);
   text_layer_destroy(s_main.loading_layer);
   status_bar_layer_destroy(s_main.status_bar);
 }
 
-static void main_mark_loaded(void) {
+static void main_loading_timer_callback(void *data) {
+  s_main.loading_timer = NULL;
   if (!s_main.loading) return;
 
   s_main.loading = false;
@@ -1108,6 +1096,9 @@ static void prv_init(void) {
     .unload = main_window_unload,
   });
   window_stack_push(s_main.window, true);
+
+  // Schedule loading timer (1 second)
+  s_main.loading_timer = app_timer_register(1000, main_loading_timer_callback, NULL);
 }
 
 static void prv_deinit(void) {
