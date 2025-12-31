@@ -1,9 +1,6 @@
 #include <pebble.h>
 
-//==============================================================================
 // Constants and Data Structures
-//==============================================================================
-
 #define MAX_RUNS 10
 #define MAX_METRICS_PER_RUN 8
 #define MAX_NAME_LENGTH 32
@@ -116,10 +113,7 @@ typedef struct {
   char buffer[MAX_VALUE_LENGTH];
 } ValueAnimState;
 
-//==============================================================================
 // Static Variables
-//==============================================================================
-
 static WandbData s_data;
 static UIState s_ui;
 static MainWindowState s_main;
@@ -133,10 +127,7 @@ static char s_page_buffer[16];
 #endif
 static char s_name_buffer[MAX_NAME_LENGTH];
 
-//==============================================================================
 // Helper Functions
-//==============================================================================
-
 static WandbMetric* get_current_metric(void) {
   return &s_data.runs[s_ui.selected_run_index].metrics[s_ui.current_metric_page];
 }
@@ -170,10 +161,7 @@ static int8_t get_run_index_for_section_row(uint16_t section, uint16_t row) {
   return -1;
 }
 
-//==============================================================================
 // Mock Data Initialization
-//==============================================================================
-
 // Helper to set mock history data
 static void set_metric_history(WandbMetric *metric, int32_t *values, uint8_t count) {
   metric->history_count = count;
@@ -252,10 +240,7 @@ static void init_mock_data(void) {
   INIT_METRIC(&run3->metrics[3], "score", "98", score_hist);
 }
 
-//==============================================================================
 // Detail Window - Display Updates
-//==============================================================================
-
 static void to_uppercase(const char *src, char *dst, size_t size) {
   size_t i;
   for (i = 0; i < size - 1 && src[i]; i++) {
@@ -287,10 +272,7 @@ static void update_detail_text(void) {
   mark_graph_dirty();
 }
 
-//==============================================================================
 // Detail Window - Skeleton Loading State
-//==============================================================================
-
 static void skeleton_layer_update_proc(Layer *layer, GContext *ctx) {
   if (!s_ui.loading) return;
 
@@ -314,10 +296,7 @@ static void skeleton_layer_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, s_detail.graph_frame, 0, GCornerNone);
 }
 
-//==============================================================================
 // Detail Window - Graph Drawing
-//==============================================================================
-
 typedef struct {
   int32_t min;
   int32_t max;
@@ -421,10 +400,7 @@ static void graph_layer_update_proc(Layer *layer, GContext *ctx) {
   draw_indicator(ctx, indicator);
 }
 
-//==============================================================================
 // Detail Window - Animations
-//==============================================================================
-
 // Parse string to fixed-point integer (scaled by FIXED_POINT_SCALE)
 static int32_t parse_fixed_point(const char *str, int *decimals) {
   int32_t result = 0;
@@ -616,10 +592,7 @@ static void do_scroll(ScrollDirection direction) {
   s_detail.scroll_animation = scroll_animation;
 }
 
-//==============================================================================
 // Detail Window - Scrub Mode
-//==============================================================================
-
 // Forward declarations
 static void do_scrub(int direction);
 static void update_scrub_name_display(void);
@@ -829,10 +802,7 @@ static void exit_scrub_mode(void) {
   schedule_scrub_animation(&s_exit_scrub_animation_impl, SCRUB_ANIM_DURATION * 2, AnimationCurveEaseOut);
 }
 
-//==============================================================================
 // Detail Window - Click Handlers
-//==============================================================================
-
 static void scrub_repeat_timer_callback(void *data) {
   if (s_scrub.active && s_scrub.repeat_direction != 0) {
     do_scrub(s_scrub.repeat_direction);
@@ -888,10 +858,7 @@ static void detail_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_SELECT, detail_select_click_handler);
 }
 
-//==============================================================================
 // Detail Window - Lifecycle
-//==============================================================================
-
 // Helper to create a styled status bar with dotted separator
 static StatusBarLayer* create_status_bar(Layer *parent) {
   StatusBarLayer *status_bar = status_bar_layer_create();
@@ -1026,10 +993,7 @@ static void detail_window_push(void) {
   s_detail.loading_timer = app_timer_register(1000, detail_loading_timer_callback, NULL);
 }
 
-//==============================================================================
 // Main Menu Window
-//==============================================================================
-
 static uint16_t menu_get_num_sections_callback(MenuLayer *menu_layer, void *data) {
   return 2;
 }
@@ -1127,10 +1091,7 @@ static void main_loading_timer_callback(void *data) {
   layer_set_hidden(text_layer_get_layer(s_main.loading_layer), true);
 }
 
-//==============================================================================
 // App Lifecycle
-//==============================================================================
-
 static void prv_init(void) {
   init_mock_data();
 

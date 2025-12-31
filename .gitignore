@@ -2,3 +2,5 @@ build/
 .lock-waf_darwin_build
 .claude/
 .cursor/
+node_modules/
+DOCS.md
