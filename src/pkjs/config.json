@@ -1,14 +1,19 @@
 [
   {
     "type": "heading",
-    "defaultValue": "Wrist & Biases Settings"
+    "defaultValue": "Wrist & Biases",
+    "size": 1
+  },
+  {
+    "type": "text",
+    "defaultValue": "This is an unofficial app that communicates directly with the Weights & Biases API. No third-party services are involved."
   },
   {
     "type": "section",
     "items": [
       {
         "type": "heading",
-        "defaultValue": "API Configuration"
+        "defaultValue": "Access"
       },
       {
         "type": "input",
@@ -18,6 +23,10 @@
         "attributes": {
           "placeholder": "Enter your W&B API key"
         }
+      },
+      {
+        "type": "text",
+        "defaultValue": "You can find your API key at <a href='https://wandb.ai/authorize' target='_blank'>wandb.ai/authorize</a>"
       },
       {
         "type": "input",

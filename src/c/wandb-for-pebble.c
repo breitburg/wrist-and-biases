@@ -716,7 +716,7 @@ static void update_scrub_name_display(void) {
 
   to_uppercase(metric->name, s_name_buffer, sizeof(s_name_buffer));
   if (s_scrub.active && s_scrub.index < metric->history_count - 1) {
-    strncat(s_name_buffer, " (PAST)", sizeof(s_name_buffer) - strlen(s_name_buffer) - 1);
+    strncat(s_name_buffer, " (-)", sizeof(s_name_buffer) - strlen(s_name_buffer) - 1);
   }
   text_layer_set_text(s_detail.name_layer, s_name_buffer);
 }
@@ -846,7 +846,7 @@ static void detail_window_load(Window *window) {
   #else
     const int16_t padding = PADDING_LEFT;
     const int16_t name_y = STATUS_BAR_HEIGHT + padding;
-    const int16_t content_width = bounds.size.w - padding;
+    const int16_t content_width = bounds.size.w - padding * 2;
     const GTextAlignment text_align = GTextAlignmentLeft;
     const int16_t graph_inset = 0;
 
@@ -963,8 +963,8 @@ static void detail_window_push(void) {
   });
   window_stack_push(s_detail.window, true);
 
-  // Schedule loading timeout (15 seconds)
-  s_detail.loading_timer = app_timer_register(15000, detail_loading_timer_callback, NULL);
+  // Schedule loading timeout (8 seconds)
+  s_detail.loading_timer = app_timer_register(8000, detail_loading_timer_callback, NULL);
 }
 
 // Main Menu Window
@@ -1064,12 +1064,15 @@ static void main_window_load(Window *window) {
 
   layer_add_child(window_layer, menu_layer_get_layer(s_main.menu));
 
-  // Loading text layer
-  GRect loading_bounds = GRect(PADDING_LEFT, STATUS_BAR_HEIGHT + PADDING_LEFT,
-                                bounds.size.w - PADDING_LEFT * 2, bounds.size.h - STATUS_BAR_HEIGHT);
+  // Loading text layer - centered horizontally and vertically
+  int16_t content_height = bounds.size.h - STATUS_BAR_HEIGHT;
+  int16_t text_height = 96;  // Allow for 3 lines
+  int16_t loading_y = STATUS_BAR_HEIGHT + (content_height - text_height) / 2;
+  GRect loading_bounds = GRect(PADDING_LEFT, loading_y, bounds.size.w - PADDING_LEFT * 2, text_height);
   s_main.loading_layer = text_layer_create(loading_bounds);
-  text_layer_set_font(s_main.loading_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_main.loading_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
   text_layer_set_text(s_main.loading_layer, "Talking with Weights & Biases...");
+  text_layer_set_text_alignment(s_main.loading_layer, GTextAlignmentCenter);
   text_layer_set_background_color(s_main.loading_layer, GColorWhite);
   layer_add_child(window_layer, text_layer_get_layer(s_main.loading_layer));
 
@@ -1106,7 +1109,7 @@ static void main_loading_timer_callback(void *data) {
   if (!s_main.loading) return;
 
   // Timeout - show "No runs" message
-  text_layer_set_text(s_main.loading_layer, "Could not load runs.\nCheck your API key.");
+  text_layer_set_text(s_main.loading_layer, "Could not load runs. Check your API key.");
 }
 
 // AppMessage Handling
@@ -1234,8 +1237,8 @@ static void prv_init(void) {
   });
   window_stack_push(s_main.window, true);
 
-  // Schedule loading timeout (15 seconds)
-  s_main.loading_timer = app_timer_register(15000, main_loading_timer_callback, NULL);
+  // Schedule loading timeout (8 seconds)
+  s_main.loading_timer = app_timer_register(8000, main_loading_timer_callback, NULL);
 }
 
 static void prv_deinit(void) {
