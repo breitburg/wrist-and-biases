@@ -39,12 +39,14 @@ typedef struct {
   uint8_t history_count;
 } WandbMetric;
 
+#define MAX_STATE_LENGTH 16
+
 typedef struct {
   char run_name[MAX_NAME_LENGTH];
   char project_name[MAX_NAME_LENGTH];
+  char state[MAX_STATE_LENGTH];
   WandbMetric metrics[MAX_METRICS_PER_RUN];
   uint8_t num_metrics;
-  bool running;
 } WandbRun;
 
 // App data (persistent)
@@ -120,6 +122,7 @@ static MainWindowState s_main;
 static DetailWindowState s_detail;
 static ScrubState s_scrub;
 static ValueAnimState s_value_anim;
+static uint8_t s_expected_runs_count;
 
 // Text buffers
 #if !defined(PBL_ROUND)
@@ -140,104 +143,62 @@ static int32_t lerp_fixed(int32_t from, int32_t to, AnimationProgress progress) 
   return from + (int32_t)(((int64_t)progress * (to - from)) / ANIMATION_NORMALIZED_MAX);
 }
 
-// Menu section helpers - section 0 = Running, section 1 = Idle
-static uint8_t count_runs_by_state(bool running) {
+// Menu section helpers - sections correspond to unique states
+// Returns the state string for a given section index (based on first occurrence order)
+static const char* get_state_for_section(uint16_t section) {
+  uint8_t unique_count = 0;
+  for (int i = 0; i < s_data.num_runs; i++) {
+    // Check if this is the first occurrence of this state
+    bool is_first = true;
+    for (int j = 0; j < i; j++) {
+      if (strcmp(s_data.runs[j].state, s_data.runs[i].state) == 0) {
+        is_first = false;
+        break;
+      }
+    }
+    if (is_first) {
+      if (unique_count == section) return s_data.runs[i].state;
+      unique_count++;
+    }
+  }
+  return NULL;
+}
+
+static uint8_t count_unique_states(void) {
   uint8_t count = 0;
   for (int i = 0; i < s_data.num_runs; i++) {
-    if (s_data.runs[i].running == running) count++;
+    bool is_first = true;
+    for (int j = 0; j < i; j++) {
+      if (strcmp(s_data.runs[j].state, s_data.runs[i].state) == 0) {
+        is_first = false;
+        break;
+      }
+    }
+    if (is_first) count++;
+  }
+  return count;
+}
+
+static uint8_t count_runs_with_state(const char *state) {
+  uint8_t count = 0;
+  for (int i = 0; i < s_data.num_runs; i++) {
+    if (strcmp(s_data.runs[i].state, state) == 0) count++;
   }
   return count;
 }
 
 static int8_t get_run_index_for_section_row(uint16_t section, uint16_t row) {
-  bool want_running = (section == 0);
+  const char *state = get_state_for_section(section);
+  if (!state) return -1;
+
   uint8_t found = 0;
   for (int i = 0; i < s_data.num_runs; i++) {
-    if (s_data.runs[i].running == want_running) {
+    if (strcmp(s_data.runs[i].state, state) == 0) {
       if (found == row) return i;
       found++;
     }
   }
   return -1;
-}
-
-// Mock Data Initialization
-// Helper to set mock history data
-static void set_metric_history(WandbMetric *metric, int32_t *values, uint8_t count) {
-  metric->history_count = count;
-  for (int i = 0; i < count; i++) {
-    metric->history[i] = values[i];
-  }
-}
-
-// Macro to reduce mock metric initialization boilerplate
-#define INIT_METRIC(m, n, v, h) do { \
-  strncpy((m)->name, (n), MAX_NAME_LENGTH); \
-  strncpy((m)->value, (v), MAX_VALUE_LENGTH); \
-  set_metric_history((m), (h), ARRAY_LENGTH(h)); \
-} while(0)
-
-static void init_mock_data(void) {
-  // All history values are in FIXED_POINT_SCALE (10000) format:
-  // "0.9523" → 9523, "50" → 500000, "12.45" → 124500
-  s_data.num_runs = 3;
-
-  // Run 1: sunny-moon-42 / image-classifier (running)
-  WandbRun *run1 = &s_data.runs[0];
-  strncpy(run1->run_name, "sunny-moon-42", MAX_NAME_LENGTH);
-  strncpy(run1->project_name, "image-classifier", MAX_NAME_LENGTH);
-  run1->num_metrics = 4;
-  run1->running = true;
-
-  int32_t acc_hist[] = {5000, 6500, 7200, 7800, 8200, 8500, 8800, 9000, 9200, 9350, 9450, 9523};
-  INIT_METRIC(&run1->metrics[0], "accuracy", "0.9523", acc_hist);
-
-  int32_t loss_hist[] = {8500, 6200, 4500, 3200, 2100, 1400, 900, 600, 400, 300, 250, 234};
-  INIT_METRIC(&run1->metrics[1], "loss", "0.0234", loss_hist);
-
-  int32_t epoch_hist[] = {0, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000};
-  INIT_METRIC(&run1->metrics[2], "epoch", "50", epoch_hist);
-
-  int32_t lr_hist[] = {10, 10, 10, 5, 5, 5, 2, 2, 1, 1};
-  INIT_METRIC(&run1->metrics[3], "lr", "0.0001", lr_hist);
-
-  // Run 2: cosmic-river-7 / text-gen (running)
-  WandbRun *run2 = &s_data.runs[1];
-  strncpy(run2->run_name, "cosmic-river-7", MAX_NAME_LENGTH);
-  strncpy(run2->project_name, "text-gen", MAX_NAME_LENGTH);
-  run2->num_metrics = 4;
-  run2->running = true;
-
-  int32_t ppl_hist[] = {4500000, 3200000, 2200000, 1500000, 1000000, 700000, 500000, 350000, 250000, 180000, 150000, 124500};
-  INIT_METRIC(&run2->metrics[0], "perplexity", "12.45", ppl_hist);
-
-  int32_t tok_hist[] = {100000, 200000, 350000, 500000, 650000, 800000, 900000, 1000000, 1100000, 1200000};
-  INIT_METRIC(&run2->metrics[1], "tokens", "120", tok_hist);
-
-  int32_t steps_hist[] = {0, 50000, 100000, 150000, 200000, 250000, 300000, 350000, 400000, 450000, 500000};
-  INIT_METRIC(&run2->metrics[2], "steps", "50", steps_hist);
-
-  int32_t loss2_hist[] = {95000, 72000, 58000, 45000, 38000, 32000, 29000, 26500, 25000, 24000, 23410};
-  INIT_METRIC(&run2->metrics[3], "loss", "2.341", loss2_hist);
-
-  // Run 3: rapid-forest-99 / rl-agent (idle)
-  WandbRun *run3 = &s_data.runs[2];
-  strncpy(run3->run_name, "rapid-forest-99", MAX_NAME_LENGTH);
-  strncpy(run3->project_name, "rl-agent", MAX_NAME_LENGTH);
-  run3->num_metrics = 4;
-  run3->running = false;
-
-  int32_t reward_hist[] = {-50000, 20000, 80000, 150000, 200000, 250000, 300000, 350000, 400000, 430000, 460000, 487200};
-  INIT_METRIC(&run3->metrics[0], "reward", "48.72", reward_hist);
-
-  int32_t ep_hist[] = {0, 100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000};
-  INIT_METRIC(&run3->metrics[1], "episodes", "100", ep_hist);
-
-  int32_t eps_hist[] = {10000, 9000, 8000, 7000, 5000, 3500, 2000, 1500, 1000, 700, 500};
-  INIT_METRIC(&run3->metrics[2], "epsilon", "0.05", eps_hist);
-
-  int32_t score_hist[] = {10000, 50000, 120000, 250000, 400000, 550000, 680000, 780000, 860000, 930000, 980000};
-  INIT_METRIC(&run3->metrics[3], "score", "98", score_hist);
 }
 
 // Detail Window - Display Updates
@@ -994,25 +955,40 @@ static void detail_window_push(void) {
 }
 
 // Main Menu Window
+static char s_header_buffer[MAX_STATE_LENGTH];
+
+static void to_uppercase_state(const char *src, char *dst, size_t size) {
+  size_t i;
+  for (i = 0; i < size - 1 && src[i]; i++) {
+    dst[i] = (src[i] >= 'a' && src[i] <= 'z') ? src[i] - 32 : src[i];
+  }
+  dst[i] = '\0';
+}
+
 static uint16_t menu_get_num_sections_callback(MenuLayer *menu_layer, void *data) {
-  return 2;
+  return count_unique_states();
 }
 
 static uint16_t menu_get_num_rows_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) {
-  return (section_index == 0) ? count_runs_by_state(true) : count_runs_by_state(false);
+  const char *state = get_state_for_section(section_index);
+  return state ? count_runs_with_state(state) : 0;
 }
 
 static int16_t menu_get_header_height_callback(MenuLayer *menu_layer, uint16_t section_index, void *data) {
-  uint8_t count = (section_index == 0) ? count_runs_by_state(true) : count_runs_by_state(false);
-  return (count > 0) ? 18 : 0;  // 14px text + 2px padding top + 2px padding bottom
+  const char *state = get_state_for_section(section_index);
+  return state ? 18 : 0;
 }
 
 static void menu_draw_header_callback(GContext *ctx, const Layer *cell_layer, uint16_t section_index, void *data) {
-  const char *title = (section_index == 0) ? "RUNNING" : "IDLE";
+  const char *state = get_state_for_section(section_index);
+  if (!state) return;
+
+  to_uppercase_state(state, s_header_buffer, sizeof(s_header_buffer));
+
   GRect bounds = layer_get_bounds(cell_layer);
   GRect text_bounds = GRect(4, 0, bounds.size.w - 8, bounds.size.h);
   graphics_context_set_text_color(ctx, GColorBlack);
-  graphics_draw_text(ctx, title, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+  graphics_draw_text(ctx, s_header_buffer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
                      text_bounds, GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
@@ -1020,7 +996,7 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
   int8_t run_index = get_run_index_for_section_row(cell_index->section, cell_index->row);
   if (run_index < 0) return;
   WandbRun *run = &s_data.runs[run_index];
-  menu_cell_basic_draw(ctx, cell_layer, run->run_name, NULL, NULL);
+  menu_cell_basic_draw(ctx, cell_layer, run->run_name, run->project_name, NULL);
 }
 
 static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
@@ -1091,9 +1067,59 @@ static void main_loading_timer_callback(void *data) {
   layer_set_hidden(text_layer_get_layer(s_main.loading_layer), true);
 }
 
+// AppMessage Handling
+static void inbox_received_callback(DictionaryIterator *iter, void *context) {
+  // Check for RUNS_COUNT (sent with first message)
+  Tuple *count_tuple = dict_find(iter, MESSAGE_KEY_RUNS_COUNT);
+  if (count_tuple) {
+    s_expected_runs_count = count_tuple->value->uint8;
+    s_data.num_runs = 0;  // Reset for new data
+  }
+
+  // Get run data
+  Tuple *name_tuple = dict_find(iter, MESSAGE_KEY_RUN_NAME);
+  Tuple *source_tuple = dict_find(iter, MESSAGE_KEY_RUN_OWNER);
+  Tuple *state_tuple = dict_find(iter, MESSAGE_KEY_RUN_STATE);
+
+  if (name_tuple && source_tuple && state_tuple && s_data.num_runs < MAX_RUNS) {
+    WandbRun *run = &s_data.runs[s_data.num_runs];
+
+    strncpy(run->run_name, name_tuple->value->cstring, MAX_NAME_LENGTH - 1);
+    run->run_name[MAX_NAME_LENGTH - 1] = '\0';
+
+    strncpy(run->project_name, source_tuple->value->cstring, MAX_NAME_LENGTH - 1);
+    run->project_name[MAX_NAME_LENGTH - 1] = '\0';
+
+    strncpy(run->state, state_tuple->value->cstring, MAX_STATE_LENGTH - 1);
+    run->state[MAX_STATE_LENGTH - 1] = '\0';
+    run->num_metrics = 0;
+
+    s_data.num_runs++;
+
+    // Check if all runs received
+    if (s_data.num_runs >= s_expected_runs_count) {
+      s_main.loading = false;
+      if (s_main.loading_timer) {
+        app_timer_cancel(s_main.loading_timer);
+        s_main.loading_timer = NULL;
+      }
+      layer_set_hidden(menu_layer_get_layer(s_main.menu), false);
+      layer_set_hidden(text_layer_get_layer(s_main.loading_layer), true);
+      menu_layer_reload_data(s_main.menu);
+    }
+  }
+}
+
+static void inbox_dropped_callback(AppMessageResult reason, void *context) {
+  APP_LOG(APP_LOG_LEVEL_ERROR, "Message dropped: %d", reason);
+}
+
 // App Lifecycle
 static void prv_init(void) {
-  init_mock_data();
+  // Initialize AppMessage
+  app_message_register_inbox_received(inbox_received_callback);
+  app_message_register_inbox_dropped(inbox_dropped_callback);
+  app_message_open(256, 64);
 
   s_main.loading = true;
   s_main.window = window_create();

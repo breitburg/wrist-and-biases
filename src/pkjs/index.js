@@ -55,7 +55,7 @@ WandbClient.prototype.request = function (query, variables, callback) {
 };
 
 WandbClient.prototype.fetchViewer = function (callback) {
-  var query = 'query { viewer { entity username teams { edges { node { name } } } } }';
+  var query = 'query { viewer { entity username } }';
   this.request(query, null, callback);
 };
 
@@ -75,47 +75,77 @@ WandbClient.prototype.fetchAllRuns = function (callback) {
   this.fetchViewer(function (err, data) {
     if (err) return callback(err, null);
 
-    var viewer = data.viewer;
-    var entities = [viewer.entity];
-    (viewer.teams && viewer.teams.edges || []).forEach(function (edge) {
-      entities.push(edge.node.name);
-    });
+    var entity = data.viewer.entity;
 
-    var allProjects = [];
-    var pendingEntities = entities.length;
+    self.fetchProjects(entity, function (err, data) {
+      if (err) return callback(err, null);
 
-    entities.forEach(function (entity) {
-      self.fetchProjects(entity, function (err, data) {
-        if (!err && data.models) {
-          data.models.edges.forEach(function (edge) {
-            allProjects.push({ entity: edge.node.entityName, name: edge.node.name });
-          });
-        }
+      var allProjects = [];
+      if (data.models) {
+        data.models.edges.forEach(function (edge) {
+          allProjects.push({ entity: edge.node.entityName, name: edge.node.name });
+        });
+      }
 
-        pendingEntities--;
-        if (pendingEntities > 0) return;
+      if (allProjects.length === 0) return callback(null, []);
 
-        if (allProjects.length === 0) return callback(null, []);
+      var allRuns = [];
+      var pendingProjects = allProjects.length;
 
-        var allRuns = [];
-        var pendingProjects = allProjects.length;
+      allProjects.forEach(function (project) {
+        self.fetchRuns(project.entity, project.name, function (err, data) {
+          if (!err && data.project && data.project.runs) {
+            data.project.runs.edges.forEach(function (edge) {
+              allRuns.push({ entity: project.entity, project: project.name, run: edge.node });
+            });
+          }
 
-        allProjects.forEach(function (project) {
-          self.fetchRuns(project.entity, project.name, function (err, data) {
-            if (!err && data.project && data.project.runs) {
-              data.project.runs.edges.forEach(function (edge) {
-                allRuns.push({ entity: project.entity, project: project.name, run: edge.node });
-              });
-            }
-
-            pendingProjects--;
-            if (pendingProjects === 0) callback(null, allRuns);
-          });
+          pendingProjects--;
+          if (pendingProjects === 0) callback(null, allRuns);
         });
       });
     });
   });
 };
+
+function sendRunsToWatch(runs) {
+  // Sort: running first, then alphabetically by state
+  runs.sort(function (a, b) {
+    var stateA = a.run.state || '';
+    var stateB = b.run.state || '';
+    if (stateA === 'running' && stateB !== 'running') return -1;
+    if (stateA !== 'running' && stateB === 'running') return 1;
+    if (stateA < stateB) return -1;
+    if (stateA > stateB) return 1;
+    return 0;
+  });
+
+  var index = 0;
+
+  function sendNext() {
+    if (index >= runs.length) return;
+
+    var item = runs[index];
+    var message = {
+      'RUN_NAME': item.run.displayName || item.run.name,
+      'RUN_OWNER': item.entity + '/' + item.project,
+      'RUN_STATE': item.run.state
+    };
+
+    if (index === 0) {
+      message['RUNS_COUNT'] = runs.length;
+    }
+
+    Pebble.sendAppMessage(message, function () {
+      index++;
+      sendNext();
+    }, function (err) {
+      console.log('Failed to send run: ' + JSON.stringify(err));
+    });
+  }
+
+  sendNext();
+}
 
 Pebble.addEventListener('ready', function () {
   console.log('PebbleKit JS ready');
@@ -136,8 +166,6 @@ Pebble.addEventListener('ready', function () {
     }
 
     console.log('Fetched ' + runs.length + ' runs');
-    runs.forEach(function (item) {
-      console.log(item.entity + '/' + item.project + ': ' + item.run.displayName + ' (' + item.run.state + ')');
-    });
+    sendRunsToWatch(runs);
   });
 });

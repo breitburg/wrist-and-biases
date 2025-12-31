@@ -25,7 +25,10 @@
       "watchface": false
     },
     "messageKeys": [
-      "apiKey"
+      "RUN_NAME",
+      "RUN_OWNER",
+      "RUN_STATE",
+      "RUNS_COUNT"
     ],
     "resources": {
       "media": [
