@@ -1058,13 +1058,23 @@ static void main_window_unload(Window *window) {
   status_bar_layer_destroy(s_main.status_bar);
 }
 
+static void hide_main_loading(void) {
+  s_main.loading = false;
+  if (s_main.loading_timer) {
+    app_timer_cancel(s_main.loading_timer);
+    s_main.loading_timer = NULL;
+  }
+  layer_set_hidden(menu_layer_get_layer(s_main.menu), false);
+  layer_set_hidden(text_layer_get_layer(s_main.loading_layer), true);
+  menu_layer_reload_data(s_main.menu);
+}
+
 static void main_loading_timer_callback(void *data) {
   s_main.loading_timer = NULL;
   if (!s_main.loading) return;
 
-  s_main.loading = false;
-  layer_set_hidden(menu_layer_get_layer(s_main.menu), false);
-  layer_set_hidden(text_layer_get_layer(s_main.loading_layer), true);
+  // Timeout - show "No runs" message
+  text_layer_set_text(s_main.loading_layer, "Could not load runs.\nCheck your API key.");
 }
 
 // AppMessage Handling
@@ -1074,6 +1084,12 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
   if (count_tuple) {
     s_expected_runs_count = count_tuple->value->uint8;
     s_data.num_runs = 0;  // Reset for new data
+
+    // Handle 0 runs case immediately
+    if (s_expected_runs_count == 0) {
+      hide_main_loading();
+      return;
+    }
   }
 
   // Get run data
@@ -1098,14 +1114,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
 
     // Check if all runs received
     if (s_data.num_runs >= s_expected_runs_count) {
-      s_main.loading = false;
-      if (s_main.loading_timer) {
-        app_timer_cancel(s_main.loading_timer);
-        s_main.loading_timer = NULL;
-      }
-      layer_set_hidden(menu_layer_get_layer(s_main.menu), false);
-      layer_set_hidden(text_layer_get_layer(s_main.loading_layer), true);
-      menu_layer_reload_data(s_main.menu);
+      hide_main_loading();
     }
   }
 }
@@ -1129,8 +1138,8 @@ static void prv_init(void) {
   });
   window_stack_push(s_main.window, true);
 
-  // Schedule loading timer (1 second)
-  s_main.loading_timer = app_timer_register(1000, main_loading_timer_callback, NULL);
+  // Schedule loading timeout (15 seconds)
+  s_main.loading_timer = app_timer_register(15000, main_loading_timer_callback, NULL);
 }
 
 static void prv_deinit(void) {

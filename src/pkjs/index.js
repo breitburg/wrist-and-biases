@@ -109,6 +109,16 @@ WandbClient.prototype.fetchAllRuns = function (callback) {
 };
 
 function sendRunsToWatch(runs) {
+  // Handle empty runs case
+  if (runs.length === 0) {
+    Pebble.sendAppMessage({ 'RUNS_COUNT': 0 }, function () {
+      console.log('Sent empty runs count');
+    }, function (err) {
+      console.log('Failed to send empty count: ' + JSON.stringify(err));
+    });
+    return;
+  }
+
   // Sort: running first, then alphabetically by state
   runs.sort(function (a, b) {
     var stateA = a.run.state || '';
