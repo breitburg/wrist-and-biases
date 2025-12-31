@@ -1,5 +1,4 @@
 build/
 .lock-waf_darwin_build
-*.png
 .claude/
 .cursor/
