@@ -2,7 +2,7 @@
 
 // Constants and Data Structures
 #define MAX_RUNS 10
-#define MAX_METRICS_PER_RUN 16
+#define MAX_METRICS_PER_RUN 18
 #define MAX_NAME_LENGTH 32
 #define MAX_VALUE_LENGTH 16
 #define MAX_HISTORY_POINTS 20

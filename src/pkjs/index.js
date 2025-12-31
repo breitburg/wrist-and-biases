@@ -114,50 +114,54 @@ WandbClient.prototype.fetchAllRuns = function (callback) {
 
 WandbClient.prototype.fetchRunMetrics = function (entity, project, runName, callback) {
   var self = this;
-  var summaryQuery = 'query($entity: String!, $project: String!, $runName: String!) { ' +
+  var infoQuery = 'query($entity: String!, $project: String!, $runName: String!) { ' +
     'project(name: $project, entityName: $entity) { ' +
       'run(name: $runName) { ' +
-        'summaryMetrics ' +
+        'summaryMetrics historyKeys ' +
       '} ' +
     '} ' +
   '}';
 
-  this.request(summaryQuery, { entity: entity, project: project, runName: runName }, function(err, data) {
+  this.request(infoQuery, { entity: entity, project: project, runName: runName }, function(err, data) {
     if (err) return callback(err, null);
 
     var run = data.project.run;
+    var allKeys = Object.keys(run.historyKeys.keys).filter(function(k) {
+      return k.charAt(0) !== '_' && k.indexOf('system/') !== 0;
+    });
 
-    var historyQuery = 'query($entity: String!, $project: String!, $runName: String!) { ' +
+    // Create separate specs for each metric to get proper sampling per metric
+    var specs = allKeys.map(function(key) {
+      return JSON.stringify({ keys: ['_step', key], samples: 20 });
+    });
+
+    console.log('Fetching ' + specs.length + ' metric histories');
+
+    var historyQuery = 'query($entity: String!, $project: String!, $runName: String!, $specs: [JSONString!]!) { ' +
       'project(name: $project, entityName: $entity) { ' +
         'run(name: $runName) { ' +
-          'history(samples: 20) ' +
+          'sampledHistory(specs: $specs) ' +
         '} ' +
       '} ' +
     '}';
 
-    self.request(historyQuery, { entity: entity, project: project, runName: runName }, function(err2, historyData) {
+    self.request(historyQuery, { entity: entity, project: project, runName: runName, specs: specs }, function(err2, historyData) {
       if (err2) return callback(err2, null);
 
-      var rawHistory = historyData.project.run.history;
-      var history;
+      // Merge all spec results into a single history keyed by metric
+      var historyByKey = {};
+      var sampledHistory = historyData.project.run.sampledHistory;
 
-      if (Array.isArray(rawHistory)) {
-        history = rawHistory;
-      } else if (typeof rawHistory === 'string') {
-        var histStr = rawHistory.trim();
-        if (histStr.charAt(0) === '{') {
-          histStr = '[' + histStr.replace(/\}\s*\{/g, '},{') + ']';
+      for (var i = 0; i < allKeys.length; i++) {
+        var key = allKeys[i];
+        var rows = sampledHistory[i];
+        if (rows && rows.length > 0) {
+          historyByKey[key] = rows;
+          console.log('Key ' + key + ' has ' + rows.length + ' points');
         }
-        history = JSON.parse(histStr);
-      } else {
-        var jsonStr = JSON.stringify(rawHistory);
-        if (jsonStr.charAt(0) === '{') {
-          jsonStr = '[' + jsonStr.replace(/\}\s*\{/g, '},{') + ']';
-        }
-        history = JSON.parse(jsonStr);
       }
 
-      callback(null, { project: { run: { summaryMetrics: run.summaryMetrics, sampledHistory: history } } });
+      callback(null, { project: { run: { summaryMetrics: run.summaryMetrics, historyByKey: historyByKey } } });
     });
   });
 };
@@ -278,7 +282,7 @@ function processRunMetrics(data) {
   var metrics = [];
 
   var summary = JSON.parse(run.summaryMetrics);
-  var historyRows = run.sampledHistory;
+  var historyByKey = run.historyByKey;
 
   var keys = Object.keys(summary);
   for (var i = 0; i < keys.length; i++) {
@@ -300,13 +304,13 @@ function processRunMetrics(data) {
     }
 
     var history = [];
-    for (var j = 0; j < historyRows.length; j++) {
-      var row = historyRows[j];
-      if (typeof row === 'string') {
-        row = JSON.parse(row);
-      }
-      if (row[key] !== undefined && row[key] !== null) {
-        history.push(toFixedPoint(row[key]));
+    var rows = historyByKey[key];
+    if (rows) {
+      for (var j = 0; j < rows.length; j++) {
+        var val = rows[j][key];
+        if (val !== undefined && val !== null) {
+          history.push(toFixedPoint(val));
+        }
       }
     }
 
