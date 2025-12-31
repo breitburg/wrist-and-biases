@@ -317,11 +317,25 @@ function processRunMetrics(data) {
     });
   }
 
-  // Sort metrics: those with history first, then by name
+  var priorities = ['loss', 'accuracy'];
+
+  function getPriority(name) {
+    var lower = name.toLowerCase();
+    for (var i = 0; i < priorities.length; i++) {
+      if (lower.indexOf(priorities[i]) !== -1) return i;
+    }
+    return priorities.length;
+  }
+
   metrics.sort(function(a, b) {
+    var aPriority = getPriority(a.name);
+    var bPriority = getPriority(b.name);
+    if (aPriority !== bPriority) return aPriority - bPriority;
+
     var aHasHistory = a.history.length > 0 ? 0 : 1;
     var bHasHistory = b.history.length > 0 ? 0 : 1;
     if (aHasHistory !== bHasHistory) return aHasHistory - bHasHistory;
+
     return a.name < b.name ? -1 : 1;
   });
 
