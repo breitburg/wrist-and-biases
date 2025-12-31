@@ -2,7 +2,7 @@
 
 // Constants and Data Structures
 #define MAX_RUNS 10
-#define MAX_METRICS_PER_RUN 8
+#define MAX_METRICS_PER_RUN 16
 #define MAX_NAME_LENGTH 32
 #define MAX_VALUE_LENGTH 16
 #define MAX_HISTORY_POINTS 20
@@ -35,7 +35,7 @@ typedef enum {
 typedef struct {
   char name[MAX_NAME_LENGTH];
   char value[MAX_VALUE_LENGTH];
-  int32_t history[MAX_HISTORY_POINTS];  // Fixed-point historical values
+  int64_t history[MAX_HISTORY_POINTS];  // Fixed-point historical values (64-bit)
   uint8_t history_count;
 } WandbMetric;
 
@@ -123,6 +123,7 @@ static DetailWindowState s_detail;
 static ScrubState s_scrub;
 static ValueAnimState s_value_anim;
 static uint8_t s_expected_runs_count;
+static uint8_t s_expected_metrics_count;
 
 // Text buffers
 #if !defined(PBL_ROUND)
@@ -259,12 +260,12 @@ static void skeleton_layer_update_proc(Layer *layer, GContext *ctx) {
 
 // Detail Window - Graph Drawing
 typedef struct {
-  int32_t min;
-  int32_t max;
-  int32_t range;
+  int64_t min;
+  int64_t max;
+  int64_t range;
 } ValueRange;
 
-static ValueRange calculate_value_range(const int32_t *values, uint8_t count) {
+static ValueRange calculate_value_range(const int64_t *values, uint8_t count) {
   ValueRange r = { .min = values[0], .max = values[0] };
   for (int i = 1; i < count; i++) {
     if (values[i] < r.min) r.min = values[i];
@@ -274,7 +275,7 @@ static ValueRange calculate_value_range(const int32_t *values, uint8_t count) {
   return r;
 }
 
-static void calculate_graph_points(GPoint *points, const int32_t *history,
+static void calculate_graph_points(GPoint *points, const int64_t *history,
     uint8_t count, GRect bounds, ValueRange range) {
   int16_t graph_height = bounds.size.h - GRAPH_PADDING;
   int16_t graph_width = bounds.size.w - GRAPH_PADDING;
@@ -399,12 +400,12 @@ static int32_t parse_fixed_point(const char *str, int *decimals) {
 }
 
 // Format fixed-point value back to string
-static void format_fixed_point(int32_t value, int decimals, char *buffer, size_t size) {
+static void format_fixed_point(int64_t value, int decimals, char *buffer, size_t size) {
   bool negative = value < 0;
   if (negative) value = -value;
 
-  int32_t integer_part = value / FIXED_POINT_SCALE;
-  int32_t frac_part = value % FIXED_POINT_SCALE;
+  int64_t integer_part = value / FIXED_POINT_SCALE;
+  int64_t frac_part = value % FIXED_POINT_SCALE;
 
   if (decimals == 0) {
     snprintf(buffer, size, "%s%ld", negative ? "-" : "", (long)integer_part);
@@ -571,12 +572,12 @@ static void update_scrub_value_display_interpolated(int32_t index_fixed) {
   int32_t frac = index_fixed % SCRUB_FIXED_SCALE;
 
   // Interpolate between history values
-  int32_t history_value;
+  int64_t history_value;
   if (idx_int >= metric->history_count - 1) {
     history_value = metric->history[metric->history_count - 1];
   } else {
-    int32_t v1 = metric->history[idx_int];
-    int32_t v2 = metric->history[idx_int + 1];
+    int64_t v1 = metric->history[idx_int];
+    int64_t v2 = metric->history[idx_int + 1];
     history_value = v1 + (v2 - v1) * frac / SCRUB_FIXED_SCALE;
   }
 
@@ -930,12 +931,24 @@ static void detail_window_unload(Window *window) {
   s_detail.window = NULL;
 }
 
+static void hide_detail_loading(void) {
+  s_ui.loading = false;
+  if (s_detail.loading_timer) {
+    app_timer_cancel(s_detail.loading_timer);
+    s_detail.loading_timer = NULL;
+  }
+  update_detail_text();
+  layer_mark_dirty(s_detail.skeleton_layer);
+}
+
 static void detail_loading_timer_callback(void *data) {
   s_detail.loading_timer = NULL;
   if (!s_ui.loading) return;
 
+  // Timeout - show error and hide skeleton
   s_ui.loading = false;
-  update_detail_text();
+  text_layer_set_text(s_detail.value_layer, "Error");
+  text_layer_set_text(s_detail.name_layer, "NO METRICS");
   layer_mark_dirty(s_detail.skeleton_layer);
 }
 
@@ -950,8 +963,8 @@ static void detail_window_push(void) {
   });
   window_stack_push(s_detail.window, true);
 
-  // Schedule loading timer (1 second)
-  s_detail.loading_timer = app_timer_register(1000, detail_loading_timer_callback, NULL);
+  // Schedule loading timeout (15 seconds)
+  s_detail.loading_timer = app_timer_register(15000, detail_loading_timer_callback, NULL);
 }
 
 // Main Menu Window
@@ -999,11 +1012,30 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
   menu_cell_basic_draw(ctx, cell_layer, run->run_name, run->project_name, NULL);
 }
 
+static void request_metrics_for_run(uint8_t run_index) {
+  DictionaryIterator *iter;
+  AppMessageResult result = app_message_outbox_begin(&iter);
+  if (result != APP_MSG_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "Failed to begin outbox: %d", result);
+    return;
+  }
+
+  dict_write_uint8(iter, MESSAGE_KEY_FETCH_RUN_INDEX, run_index);
+  result = app_message_outbox_send();
+  if (result != APP_MSG_OK) {
+    APP_LOG(APP_LOG_LEVEL_ERROR, "Failed to send outbox: %d", result);
+  }
+}
+
 static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
   int8_t run_index = get_run_index_for_section_row(cell_index->section, cell_index->row);
   if (run_index < 0) return;
   s_ui.selected_run_index = run_index;
   s_ui.current_metric_page = 0;
+
+  // Request metrics from JS
+  request_metrics_for_run(run_index);
+
   detail_window_push();
 }
 
@@ -1117,6 +1149,70 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       hide_main_loading();
     }
   }
+
+  // Check for METRICS_COUNT (sent with first metric message)
+  Tuple *metrics_count_tuple = dict_find(iter, MESSAGE_KEY_METRICS_COUNT);
+  if (metrics_count_tuple) {
+    s_expected_metrics_count = metrics_count_tuple->value->uint8;
+    // Reset metrics for current run
+    WandbRun *run = &s_data.runs[s_ui.selected_run_index];
+    run->num_metrics = 0;
+
+    // Handle 0 metrics case immediately
+    if (s_expected_metrics_count == 0) {
+      hide_detail_loading();
+      return;
+    }
+  }
+
+  // Get metric data
+  Tuple *metric_name_tuple = dict_find(iter, MESSAGE_KEY_METRIC_NAME);
+  Tuple *metric_value_tuple = dict_find(iter, MESSAGE_KEY_METRIC_VALUE);
+  Tuple *metric_history_tuple = dict_find(iter, MESSAGE_KEY_METRIC_HISTORY);
+
+  if (metric_name_tuple && metric_value_tuple) {
+    WandbRun *run = &s_data.runs[s_ui.selected_run_index];
+
+    // Only accept if we have room
+    if (run->num_metrics < MAX_METRICS_PER_RUN) {
+      WandbMetric *metric = &run->metrics[run->num_metrics];
+
+      strncpy(metric->name, metric_name_tuple->value->cstring, MAX_NAME_LENGTH - 1);
+      metric->name[MAX_NAME_LENGTH - 1] = '\0';
+
+      strncpy(metric->value, metric_value_tuple->value->cstring, MAX_VALUE_LENGTH - 1);
+      metric->value[MAX_VALUE_LENGTH - 1] = '\0';
+
+      // Parse history if present (packed int64 array)
+      metric->history_count = 0;
+      if (metric_history_tuple && metric_history_tuple->length > 0) {
+        uint8_t *bytes = metric_history_tuple->value->data;
+        uint16_t num_points = metric_history_tuple->length / 8;
+        if (num_points > MAX_HISTORY_POINTS) num_points = MAX_HISTORY_POINTS;
+
+        for (int i = 0; i < num_points; i++) {
+          // Little-endian int64
+          uint32_t low = bytes[i * 8] |
+            (bytes[i * 8 + 1] << 8) |
+            (bytes[i * 8 + 2] << 16) |
+            (bytes[i * 8 + 3] << 24);
+          uint32_t high = bytes[i * 8 + 4] |
+            (bytes[i * 8 + 5] << 8) |
+            (bytes[i * 8 + 6] << 16) |
+            (bytes[i * 8 + 7] << 24);
+          metric->history[i] = (int64_t)(((uint64_t)high << 32) | low);
+        }
+        metric->history_count = num_points;
+      }
+
+      run->num_metrics++;
+    }
+
+    // Check if all metrics received (or we're full)
+    if (run->num_metrics >= s_expected_metrics_count || run->num_metrics >= MAX_METRICS_PER_RUN) {
+      hide_detail_loading();
+    }
+  }
 }
 
 static void inbox_dropped_callback(AppMessageResult reason, void *context) {
@@ -1128,7 +1224,7 @@ static void prv_init(void) {
   // Initialize AppMessage
   app_message_register_inbox_received(inbox_received_callback);
   app_message_register_inbox_dropped(inbox_dropped_callback);
-  app_message_open(256, 64);
+  app_message_open(512, 64);
 
   s_main.loading = true;
   s_main.window = window_create();
