@@ -2,10 +2,10 @@
 
 // Constants and Data Structures
 #define MAX_RUNS 10
-#define MAX_METRICS_PER_RUN 18
 #define MAX_NAME_LENGTH 32
 #define MAX_VALUE_LENGTH 16
 #define MAX_HISTORY_POINTS 20
+#define METRIC_BUFFER_SIZE 3
 
 #define PADDING_LEFT 10
 #define ANIM_DURATION 200
@@ -23,6 +23,8 @@
 #define SCRUB_ANIM_DURATION 100
 #define SCRUB_REPEAT_INTERVAL 150
 #define WIGGLE_ANIM_DURATION 300
+#define REQUEST_DEBOUNCE_MS 300
+#define REQUEST_STAGGER_MS 100
 
 // Fixed-point arithmetic for value interpolation (4 decimal places)
 #define FIXED_POINT_SCALE 10000
@@ -39,14 +41,32 @@ typedef struct {
   uint8_t history_count;
 } WandbMetric;
 
+// Metric buffer slot states
+typedef enum {
+  SLOT_EMPTY,
+  SLOT_LOADING,
+  SLOT_READY
+} MetricSlotState;
+
+// A single buffer slot containing one metric and its metadata
+typedef struct {
+  WandbMetric metric;
+  int8_t metric_id;         // Which metric index this is (-1 if empty)
+  MetricSlotState state;
+} MetricBufferSlot;
+
+// The 3-slot sliding window buffer
+typedef struct {
+  MetricBufferSlot slots[METRIC_BUFFER_SIZE];
+} MetricBuffer;
+
 #define MAX_STATE_LENGTH 16
 
 typedef struct {
   char run_name[MAX_NAME_LENGTH];
   char project_name[MAX_NAME_LENGTH];
   char state[MAX_STATE_LENGTH];
-  WandbMetric metrics[MAX_METRICS_PER_RUN];
-  uint8_t num_metrics;
+  uint8_t total_metrics;  // Total number of metrics for this run
 } WandbRun;
 
 // App data (persistent)
@@ -79,10 +99,8 @@ typedef struct {
   TextLayer *value_layer;
   TextLayer *name_layer;
   Layer *graph_layer;
-  Layer *skeleton_layer;
   StatusBarLayer *status_bar;
   TextLayer *pagination_layer;
-  AppTimer *loading_timer;
   GRect value_frame;
   GRect name_frame;
   GRect graph_frame;
@@ -122,8 +140,8 @@ static MainWindowState s_main;
 static DetailWindowState s_detail;
 static ScrubState s_scrub;
 static ValueAnimState s_value_anim;
+static MetricBuffer s_metric_buffer;
 static uint8_t s_expected_runs_count;
-static uint8_t s_expected_metrics_count;
 
 // Text buffers
 #if !defined(PBL_ROUND)
@@ -132,12 +150,140 @@ static char s_page_buffer[16];
 static char s_name_buffer[MAX_NAME_LENGTH];
 
 // Helper Functions
-static WandbMetric* get_current_metric(void) {
-  return &s_data.runs[s_ui.selected_run_index].metrics[s_ui.current_metric_page];
-}
-
 static inline void mark_graph_dirty(void) {
   if (s_detail.graph_layer) layer_mark_dirty(s_detail.graph_layer);
+}
+
+// Buffer management functions
+static void metric_buffer_init(void) {
+  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+    s_metric_buffer.slots[i].metric_id = -1;
+    s_metric_buffer.slots[i].state = SLOT_EMPTY;
+  }
+}
+
+static void metric_buffer_clear(void) {
+  metric_buffer_init();
+}
+
+// Get metric from buffer by ID, returns NULL if not ready
+static WandbMetric* get_metric_from_buffer(uint8_t metric_id) {
+  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+    if (s_metric_buffer.slots[i].metric_id == metric_id &&
+        s_metric_buffer.slots[i].state == SLOT_READY) {
+      return &s_metric_buffer.slots[i].metric;
+    }
+  }
+  return NULL;
+}
+
+// Get current metric from buffer (or NULL if not ready)
+static WandbMetric* get_current_metric(void) {
+  return get_metric_from_buffer(s_ui.current_metric_page);
+}
+
+// Check if a metric is in the buffer (any state except EMPTY)
+static bool is_metric_in_buffer(uint8_t metric_id) {
+  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+    if (s_metric_buffer.slots[i].metric_id == metric_id &&
+        s_metric_buffer.slots[i].state != SLOT_EMPTY) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Find best slot for a new metric (LRU-like based on distance from current page)
+static int8_t find_slot_for_metric(uint8_t metric_id) {
+  // First, check if already assigned
+  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+    if (s_metric_buffer.slots[i].metric_id == metric_id) {
+      return i;
+    }
+  }
+
+  // Find empty slot
+  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+    if (s_metric_buffer.slots[i].state == SLOT_EMPTY) {
+      return i;
+    }
+  }
+
+  // Replace the slot furthest from current page
+  int max_distance = -1;
+  int8_t furthest = 0;
+  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+    int distance = s_metric_buffer.slots[i].metric_id >= s_ui.current_metric_page
+      ? s_metric_buffer.slots[i].metric_id - s_ui.current_metric_page
+      : s_ui.current_metric_page - s_metric_buffer.slots[i].metric_id;
+    if (distance > max_distance) {
+      max_distance = distance;
+      furthest = i;
+    }
+  }
+  return furthest;
+}
+
+// Forward declaration for request_metric
+static void request_metric(uint8_t run_index, uint8_t metric_index);
+
+// Timers for staggered metric requests
+static AppTimer *s_request_current_timer = NULL;
+static AppTimer *s_request_next_timer = NULL;
+static AppTimer *s_request_prev_timer = NULL;
+
+static void cancel_all_request_timers(void) {
+  if (s_request_current_timer) {
+    app_timer_cancel(s_request_current_timer);
+    s_request_current_timer = NULL;
+  }
+  if (s_request_next_timer) {
+    app_timer_cancel(s_request_next_timer);
+    s_request_next_timer = NULL;
+  }
+  if (s_request_prev_timer) {
+    app_timer_cancel(s_request_prev_timer);
+    s_request_prev_timer = NULL;
+  }
+}
+
+static void do_request_current(void *context) {
+  s_request_current_timer = NULL;
+  uint8_t current = s_ui.current_metric_page;
+  if (!is_metric_in_buffer(current)) {
+    request_metric(s_ui.selected_run_index, current);
+  }
+}
+
+static void do_request_next(void *context) {
+  s_request_next_timer = NULL;
+  uint8_t current = s_ui.current_metric_page;
+  uint8_t total = s_data.runs[s_ui.selected_run_index].total_metrics;
+  if (current + 1 < total && !is_metric_in_buffer(current + 1)) {
+    request_metric(s_ui.selected_run_index, current + 1);
+  }
+}
+
+static void do_request_prev(void *context) {
+  s_request_prev_timer = NULL;
+  uint8_t current = s_ui.current_metric_page;
+  if (current > 0 && !is_metric_in_buffer(current - 1)) {
+    request_metric(s_ui.selected_run_index, current - 1);
+  }
+}
+
+// Request metrics: current immediately, adjacent after delays
+static void request_adjacent_metrics(void) {
+  cancel_all_request_timers();
+
+  // Current metric: after short debounce (in case of rapid scrolling)
+  s_request_current_timer = app_timer_register(REQUEST_DEBOUNCE_MS, do_request_current, NULL);
+
+  // Next metric: after current has time to send
+  s_request_next_timer = app_timer_register(REQUEST_DEBOUNCE_MS + REQUEST_STAGGER_MS, do_request_next, NULL);
+
+  // Previous metric: after next has time to send
+  s_request_prev_timer = app_timer_register(REQUEST_DEBOUNCE_MS + REQUEST_STAGGER_MS * 2, do_request_prev, NULL);
 }
 
 static int32_t lerp_fixed(int32_t from, int32_t to, AnimationProgress progress) {
@@ -218,44 +364,24 @@ static void to_uppercase(const char *src, char *dst, size_t size) {
 static void update_detail_text(void) {
   WandbMetric *metric = get_current_metric();
 
-  text_layer_set_text(s_detail.value_layer, metric->value);
-
-  to_uppercase(metric->name, s_name_buffer, sizeof(s_name_buffer));
-  text_layer_set_text(s_detail.name_layer, s_name_buffer);
+  // Only update text when metric is loaded - skeleton draws on top otherwise
+  if (metric) {
+    text_layer_set_text(s_detail.value_layer, metric->value);
+    to_uppercase(metric->name, s_name_buffer, sizeof(s_name_buffer));
+    text_layer_set_text(s_detail.name_layer, s_name_buffer);
+  }
 
   #if !defined(PBL_ROUND)
     WandbRun *run = &s_data.runs[s_ui.selected_run_index];
-    snprintf(s_page_buffer, sizeof(s_page_buffer), "%d/%d",
-             s_ui.current_metric_page + 1, run->num_metrics);
-    text_layer_set_text(s_detail.pagination_layer, s_page_buffer);
+    if (run->total_metrics > 0) {
+      snprintf(s_page_buffer, sizeof(s_page_buffer), "%d/%d",
+               s_ui.current_metric_page + 1, run->total_metrics);
+      text_layer_set_text(s_detail.pagination_layer, s_page_buffer);
+    }
   #endif
 
   s_ui.graph_display_page = s_ui.current_metric_page;
   mark_graph_dirty();
-}
-
-// Detail Window - Skeleton Loading State
-static void skeleton_layer_update_proc(Layer *layer, GContext *ctx) {
-  if (!s_ui.loading) return;
-
-  graphics_context_set_fill_color(ctx, GColorLightGray);
-
-  // Draw skeleton rectangle for name (slightly smaller than frame)
-  GRect name_skeleton = s_detail.name_frame;
-  name_skeleton.size.w = 80;
-  name_skeleton.size.h = 14;
-  name_skeleton.origin.y += 4;
-  graphics_fill_rect(ctx, name_skeleton, 0, GCornerNone);
-
-  // Draw skeleton rectangle for value (larger rectangle)
-  GRect value_skeleton = s_detail.value_frame;
-  value_skeleton.size.w = 100;
-  value_skeleton.size.h = 26;
-  value_skeleton.origin.y += 3;
-  graphics_fill_rect(ctx, value_skeleton, 0, GCornerNone);
-
-  // Draw skeleton rectangle for graph area
-  graphics_fill_rect(ctx, s_detail.graph_frame, 0, GCornerNone);
 }
 
 // Detail Window - Graph Drawing
@@ -336,13 +462,67 @@ static void draw_indicator(GContext *ctx, GPoint position) {
   graphics_fill_rect(ctx, GRect(position.x - half, position.y - half, INDICATOR_SIZE, INDICATOR_SIZE), 0, GCornerNone);
 }
 
+static void draw_skeleton_rects(GContext *ctx, GRect graph_bounds) {
+  // Calculate offsets from graph layer to name/value frames
+  int16_t graph_x = s_detail.graph_frame.origin.x;
+  int16_t graph_y = s_detail.graph_frame.origin.y;
+
+  // Name area (relative to graph layer position)
+  GRect name_area = GRect(
+    s_detail.name_frame.origin.x - graph_x,
+    s_detail.name_frame.origin.y - graph_y,
+    s_detail.name_frame.size.w,
+    s_detail.name_frame.size.h
+  );
+
+  // Value area
+  GRect value_area = GRect(
+    s_detail.value_frame.origin.x - graph_x,
+    s_detail.value_frame.origin.y - graph_y,
+    s_detail.value_frame.size.w,
+    s_detail.value_frame.size.h
+  );
+
+  // Fill white background to cover text underneath
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, name_area, 0, GCornerNone);
+  graphics_fill_rect(ctx, value_area, 0, GCornerNone);
+  graphics_fill_rect(ctx, graph_bounds, 0, GCornerNone);
+
+  // Draw gray skeleton rectangles on top
+  graphics_context_set_fill_color(ctx, GColorLightGray);
+
+  GRect name_skeleton = name_area;
+  name_skeleton.origin.y += 4;
+  name_skeleton.size.w = 80;
+  name_skeleton.size.h = 14;
+  graphics_fill_rect(ctx, name_skeleton, 0, GCornerNone);
+
+  GRect value_skeleton = value_area;
+  value_skeleton.origin.y += 3;
+  value_skeleton.size.w = 100;
+  value_skeleton.size.h = 26;
+  graphics_fill_rect(ctx, value_skeleton, 0, GCornerNone);
+
+  graphics_fill_rect(ctx, graph_bounds, 0, GCornerNone);
+}
+
 static void graph_layer_update_proc(Layer *layer, GContext *ctx) {
-  if (s_ui.loading) return;
-
   GRect bounds = layer_get_bounds(layer);
-  WandbMetric *metric = &s_data.runs[s_ui.selected_run_index].metrics[s_ui.graph_display_page];
+  WandbMetric *metric = get_metric_from_buffer(s_ui.graph_display_page);
 
-  if (metric->history_count < 2) return;
+  // Draw skeleton if metric not loaded
+  if (!metric) {
+    draw_skeleton_rects(ctx, bounds);
+    return;
+  }
+
+  // Draw graph skeleton if insufficient history (but name/value are valid)
+  if (metric->history_count < 2) {
+    graphics_context_set_fill_color(ctx, GColorLightGray);
+    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+    return;
+  }
 
   ValueRange range = calculate_value_range(metric->history, metric->history_count);
 
@@ -430,7 +610,10 @@ static void value_animation_update(Animation *animation, const AnimationProgress
 
 static void value_animation_teardown(Animation *animation) {
   WandbMetric *metric = get_current_metric();
-  text_layer_set_text(s_detail.value_layer, metric->value);
+  // Only set final value if metric is loaded
+  if (metric) {
+    text_layer_set_text(s_detail.value_layer, metric->value);
+  }
 }
 
 static const AnimationImplementation s_value_animation_impl = {
@@ -454,14 +637,19 @@ static Animation *create_value_interpolation_animation(const char *from_value, c
 static void on_name_outbound_stopped(Animation *animation, bool finished, void *context) {
   WandbMetric *metric = get_current_metric();
 
-  to_uppercase(metric->name, s_name_buffer, sizeof(s_name_buffer));
-  text_layer_set_text(s_detail.name_layer, s_name_buffer);
+  // Only update text if metric loaded - skeleton covers it otherwise
+  if (metric) {
+    to_uppercase(metric->name, s_name_buffer, sizeof(s_name_buffer));
+    text_layer_set_text(s_detail.name_layer, s_name_buffer);
+  }
 
   #if !defined(PBL_ROUND)
     WandbRun *run = &s_data.runs[s_ui.selected_run_index];
-    snprintf(s_page_buffer, sizeof(s_page_buffer), "%d/%d",
-             s_ui.current_metric_page + 1, run->num_metrics);
-    text_layer_set_text(s_detail.pagination_layer, s_page_buffer);
+    if (run->total_metrics > 0) {
+      snprintf(s_page_buffer, sizeof(s_page_buffer), "%d/%d",
+               s_ui.current_metric_page + 1, run->total_metrics);
+      text_layer_set_text(s_detail.pagination_layer, s_page_buffer);
+    }
   #endif
 
   s_ui.graph_display_page = s_ui.current_metric_page;
@@ -513,13 +701,19 @@ static Animation *create_layer_bounce_animation(Layer *layer, GRect *home_frame,
 static Animation *create_scroll_animation(ScrollDirection direction, const char *old_value) {
   WandbMetric *metric = get_current_metric();
 
-  Animation *value_anim = create_value_interpolation_animation(old_value, metric->value);
   Animation *name_anim = create_layer_slide_animation(
     text_layer_get_layer(s_detail.name_layer), &s_detail.name_frame, direction, on_name_outbound_stopped);
   Animation *graph_anim = create_layer_slide_animation(
     s_detail.graph_layer, &s_detail.graph_frame, direction, NULL);
 
-  return animation_spawn_create(value_anim, name_anim, graph_anim, NULL);
+  // If both old and new metrics are loaded, animate value interpolation
+  if (metric && old_value) {
+    Animation *value_anim = create_value_interpolation_animation(old_value, metric->value);
+    return animation_spawn_create(value_anim, name_anim, graph_anim, NULL);
+  }
+
+  // Otherwise just slide name/graph (skeleton will cover value area)
+  return animation_spawn_create(name_anim, graph_anim, NULL);
 }
 
 static Animation *create_bounce_animation(ScrollDirection direction) {
@@ -538,12 +732,18 @@ static void do_scroll(ScrollDirection direction) {
 
   Animation *scroll_animation;
 
-  if (next_page < 0 || next_page >= run->num_metrics) {
+  if (next_page < 0 || next_page >= run->total_metrics) {
     scroll_animation = create_bounce_animation(direction);
   } else {
-    const char *old_value = run->metrics[s_ui.current_metric_page].value;
+    // Get old value if current metric is loaded
+    WandbMetric *old_metric = get_current_metric();
+    const char *old_value = old_metric ? old_metric->value : NULL;
+
     s_ui.current_metric_page = next_page;
     scroll_animation = create_scroll_animation(direction, old_value);
+
+    // Request adjacent metrics for the new position
+    request_adjacent_metrics();
   }
 
   if (s_detail.scroll_animation) {
@@ -724,6 +924,9 @@ static void update_scrub_name_display(void) {
 static void enter_scrub_mode(void) {
   WandbMetric *metric = get_current_metric();
 
+  // Can't enter scrub mode if metric not loaded or has insufficient history
+  if (!metric || metric->history_count < 2) return;
+
   s_scrub.active = true;
   s_scrub.index = metric->history_count - 1;
   s_scrub.current_index_fixed = s_scrub.index * SCRUB_FIXED_SCALE;
@@ -742,10 +945,11 @@ static void exit_scrub_animation_teardown(Animation *animation) {
   s_scrub.animation = NULL;
 
   WandbMetric *metric = get_current_metric();
-  text_layer_set_text(s_detail.value_layer, metric->value);
-
-  to_uppercase(metric->name, s_name_buffer, sizeof(s_name_buffer));
-  text_layer_set_text(s_detail.name_layer, s_name_buffer);
+  if (metric) {
+    text_layer_set_text(s_detail.value_layer, metric->value);
+    to_uppercase(metric->name, s_name_buffer, sizeof(s_name_buffer));
+    text_layer_set_text(s_detail.name_layer, s_name_buffer);
+  }
 
   mark_graph_dirty();
 }
@@ -892,29 +1096,17 @@ static void detail_window_load(Window *window) {
   layer_set_clips(s_detail.graph_layer, false);
   layer_add_child(window_layer, s_detail.graph_layer);
 
-  // Skeleton layer (drawn on top when loading)
-  s_detail.skeleton_layer = layer_create(bounds);
-  layer_set_update_proc(s_detail.skeleton_layer, skeleton_layer_update_proc);
-  layer_add_child(window_layer, s_detail.skeleton_layer);
-
   // Reset state
   s_detail.scroll_animation = NULL;
   s_scrub.active = false;
 
-  // Don't call update_detail_text() when loading - skeleton shows instead
-  if (!s_ui.loading) {
-    update_detail_text();
-  }
+  // Update display (will show skeleton if metric not loaded)
+  update_detail_text();
 }
 
 static void detail_window_unload(Window *window) {
   s_scrub.active = false;
-  s_ui.loading = false;
 
-  if (s_detail.loading_timer) {
-    app_timer_cancel(s_detail.loading_timer);
-    s_detail.loading_timer = NULL;
-  }
   if (s_detail.scroll_animation) {
     animation_unschedule(s_detail.scroll_animation);
     s_detail.scroll_animation = NULL;
@@ -922,7 +1114,6 @@ static void detail_window_unload(Window *window) {
   text_layer_destroy(s_detail.value_layer);
   text_layer_destroy(s_detail.name_layer);
   layer_destroy(s_detail.graph_layer);
-  layer_destroy(s_detail.skeleton_layer);
   #if !defined(PBL_ROUND)
     text_layer_destroy(s_detail.pagination_layer);
   #endif
@@ -931,30 +1122,13 @@ static void detail_window_unload(Window *window) {
   s_detail.window = NULL;
 }
 
-static void hide_detail_loading(void) {
-  s_ui.loading = false;
-  if (s_detail.loading_timer) {
-    app_timer_cancel(s_detail.loading_timer);
-    s_detail.loading_timer = NULL;
-  }
+// Called when a metric for the current page is received
+static void on_current_metric_ready(void) {
+  if (!s_detail.window) return;
   update_detail_text();
-  layer_mark_dirty(s_detail.skeleton_layer);
-}
-
-static void detail_loading_timer_callback(void *data) {
-  s_detail.loading_timer = NULL;
-  if (!s_ui.loading) return;
-
-  // Timeout - show error and hide skeleton
-  s_ui.loading = false;
-  text_layer_set_text(s_detail.value_layer, "Error");
-  text_layer_set_text(s_detail.name_layer, "NO METRICS");
-  layer_mark_dirty(s_detail.skeleton_layer);
 }
 
 static void detail_window_push(void) {
-  s_ui.loading = true;
-
   s_detail.window = window_create();
   window_set_click_config_provider(s_detail.window, detail_click_config_provider);
   window_set_window_handlers(s_detail.window, (WindowHandlers) {
@@ -962,9 +1136,6 @@ static void detail_window_push(void) {
     .unload = detail_window_unload,
   });
   window_stack_push(s_detail.window, true);
-
-  // Schedule loading timeout (8 seconds)
-  s_detail.loading_timer = app_timer_register(8000, detail_loading_timer_callback, NULL);
 }
 
 // Main Menu Window
@@ -1012,7 +1183,9 @@ static void menu_draw_row_callback(GContext *ctx, const Layer *cell_layer, MenuI
   menu_cell_basic_draw(ctx, cell_layer, run->run_name, run->project_name, NULL);
 }
 
-static void request_metrics_for_run(uint8_t run_index) {
+// Request a single metric by index
+static void request_metric(uint8_t run_index, uint8_t metric_index) {
+  // Try to begin outbox first - don't touch buffer if it fails
   DictionaryIterator *iter;
   AppMessageResult result = app_message_outbox_begin(&iter);
   if (result != APP_MSG_OK) {
@@ -1020,10 +1193,18 @@ static void request_metrics_for_run(uint8_t run_index) {
     return;
   }
 
+  // Outbox available - now mark slot as loading
+  int8_t slot = find_slot_for_metric(metric_index);
+  s_metric_buffer.slots[slot].metric_id = metric_index;
+  s_metric_buffer.slots[slot].state = SLOT_LOADING;
+
   dict_write_uint8(iter, MESSAGE_KEY_FETCH_RUN_INDEX, run_index);
+  dict_write_uint8(iter, MESSAGE_KEY_FETCH_METRIC_INDEX, metric_index);
   result = app_message_outbox_send();
   if (result != APP_MSG_OK) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "Failed to send outbox: %d", result);
+    // Reset slot since send failed
+    s_metric_buffer.slots[slot].state = SLOT_EMPTY;
   }
 }
 
@@ -1033,8 +1214,9 @@ static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, v
   s_ui.selected_run_index = run_index;
   s_ui.current_metric_page = 0;
 
-  // Request metrics from JS
-  request_metrics_for_run(run_index);
+  // Clear buffer and request initial metrics
+  metric_buffer_clear();
+  request_adjacent_metrics();
 
   detail_window_push();
 }
@@ -1143,7 +1325,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
 
     strncpy(run->state, state_tuple->value->cstring, MAX_STATE_LENGTH - 1);
     run->state[MAX_STATE_LENGTH - 1] = '\0';
-    run->num_metrics = 0;
+    run->total_metrics = 0;
 
     s_data.num_runs++;
 
@@ -1153,90 +1335,102 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     }
   }
 
-  // Check for METRICS_COUNT (sent with first metric message)
+  // Check for METRICS_COUNT (sent with metric messages)
   Tuple *metrics_count_tuple = dict_find(iter, MESSAGE_KEY_METRICS_COUNT);
   if (metrics_count_tuple) {
-    s_expected_metrics_count = metrics_count_tuple->value->uint8;
-    // Reset metrics for current run
     WandbRun *run = &s_data.runs[s_ui.selected_run_index];
-    run->num_metrics = 0;
+    uint8_t new_total = metrics_count_tuple->value->uint8;
 
-    // Handle 0 metrics case immediately
-    if (s_expected_metrics_count == 0) {
-      hide_detail_loading();
-      return;
+    // If we just learned the total, request adjacent metrics
+    if (run->total_metrics == 0 && new_total > 0) {
+      run->total_metrics = new_total;
+      request_adjacent_metrics();
+    } else {
+      run->total_metrics = new_total;
     }
   }
 
-  // Get metric data
+  // Get metric data with index
+  Tuple *metric_index_tuple = dict_find(iter, MESSAGE_KEY_METRIC_INDEX);
   Tuple *metric_name_tuple = dict_find(iter, MESSAGE_KEY_METRIC_NAME);
   Tuple *metric_value_tuple = dict_find(iter, MESSAGE_KEY_METRIC_VALUE);
   Tuple *metric_history_tuple = dict_find(iter, MESSAGE_KEY_METRIC_HISTORY);
 
-  if (metric_name_tuple && metric_value_tuple) {
-    WandbRun *run = &s_data.runs[s_ui.selected_run_index];
+  if (metric_index_tuple && metric_name_tuple && metric_value_tuple) {
+    uint8_t metric_index = metric_index_tuple->value->uint8;
 
-    // Only accept if we have room
-    if (run->num_metrics < MAX_METRICS_PER_RUN) {
-      WandbMetric *metric = &run->metrics[run->num_metrics];
-
-      strncpy(metric->name, metric_name_tuple->value->cstring, MAX_NAME_LENGTH - 1);
-      metric->name[MAX_NAME_LENGTH - 1] = '\0';
-
-      strncpy(metric->value, metric_value_tuple->value->cstring, MAX_VALUE_LENGTH - 1);
-      metric->value[MAX_VALUE_LENGTH - 1] = '\0';
-
-      // Parse history if present (packed int64 array)
-      metric->history_count = 0;
-      if (metric_history_tuple && metric_history_tuple->length > 0) {
-        uint8_t *bytes = metric_history_tuple->value->data;
-        uint16_t num_points = metric_history_tuple->length / 8;
-        if (num_points > MAX_HISTORY_POINTS) num_points = MAX_HISTORY_POINTS;
-
-        for (int i = 0; i < num_points; i++) {
-          // Little-endian int64
-          uint32_t low = bytes[i * 8] |
-            (bytes[i * 8 + 1] << 8) |
-            (bytes[i * 8 + 2] << 16) |
-            (bytes[i * 8 + 3] << 24);
-          uint32_t high = bytes[i * 8 + 4] |
-            (bytes[i * 8 + 5] << 8) |
-            (bytes[i * 8 + 6] << 16) |
-            (bytes[i * 8 + 7] << 24);
-          metric->history[i] = (int64_t)(((uint64_t)high << 32) | low);
-        }
-        metric->history_count = num_points;
+    // Find the slot for this metric
+    int8_t slot = -1;
+    for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+      if (s_metric_buffer.slots[i].metric_id == metric_index) {
+        slot = i;
+        break;
       }
+    }
 
-      // Check if current value differs from last history point and add it
-      if (metric->history_count > 0) {
-        int decimals;
-        int64_t current_value = (int64_t)parse_fixed_point(metric->value, &decimals);
-        int64_t last_history = metric->history[metric->history_count - 1];
+    // If not found (race condition), assign a slot
+    if (slot < 0) {
+      slot = find_slot_for_metric(metric_index);
+      s_metric_buffer.slots[slot].metric_id = metric_index;
+    }
 
-        if (current_value != last_history) {
-          // Need to add current value to history
-          if (metric->history_count >= MAX_HISTORY_POINTS) {
-            // At capacity - shift left to make room
-            for (int i = 0; i < MAX_HISTORY_POINTS - 1; i++) {
-              metric->history[i] = metric->history[i + 1];
-            }
-            metric->history[MAX_HISTORY_POINTS - 1] = current_value;
-          } else {
-            // Just append
-            metric->history[metric->history_count] = current_value;
-            metric->history_count++;
+    MetricBufferSlot *buf_slot = &s_metric_buffer.slots[slot];
+    WandbMetric *metric = &buf_slot->metric;
+
+    strncpy(metric->name, metric_name_tuple->value->cstring, MAX_NAME_LENGTH - 1);
+    metric->name[MAX_NAME_LENGTH - 1] = '\0';
+
+    strncpy(metric->value, metric_value_tuple->value->cstring, MAX_VALUE_LENGTH - 1);
+    metric->value[MAX_VALUE_LENGTH - 1] = '\0';
+
+    // Parse history if present (packed int64 array)
+    metric->history_count = 0;
+    if (metric_history_tuple && metric_history_tuple->length > 0) {
+      uint8_t *bytes = metric_history_tuple->value->data;
+      uint16_t num_points = metric_history_tuple->length / 8;
+      if (num_points > MAX_HISTORY_POINTS) num_points = MAX_HISTORY_POINTS;
+
+      for (int i = 0; i < num_points; i++) {
+        // Little-endian int64
+        uint32_t low = bytes[i * 8] |
+          (bytes[i * 8 + 1] << 8) |
+          (bytes[i * 8 + 2] << 16) |
+          (bytes[i * 8 + 3] << 24);
+        uint32_t high = bytes[i * 8 + 4] |
+          (bytes[i * 8 + 5] << 8) |
+          (bytes[i * 8 + 6] << 16) |
+          (bytes[i * 8 + 7] << 24);
+        metric->history[i] = (int64_t)(((uint64_t)high << 32) | low);
+      }
+      metric->history_count = num_points;
+    }
+
+    // Check if current value differs from last history point and add it
+    if (metric->history_count > 0) {
+      int decimals;
+      int64_t current_value = (int64_t)parse_fixed_point(metric->value, &decimals);
+      int64_t last_history = metric->history[metric->history_count - 1];
+
+      if (current_value != last_history) {
+        // Need to add current value to history
+        if (metric->history_count >= MAX_HISTORY_POINTS) {
+          // At capacity - shift left to make room
+          for (int i = 0; i < MAX_HISTORY_POINTS - 1; i++) {
+            metric->history[i] = metric->history[i + 1];
           }
+          metric->history[MAX_HISTORY_POINTS - 1] = current_value;
+        } else {
+          // Just append
+          metric->history[metric->history_count] = current_value;
+          metric->history_count++;
         }
       }
-
-      run->num_metrics++;
     }
 
-    // Check if all metrics received (or we're full)
-    if (run->num_metrics >= s_expected_metrics_count || run->num_metrics >= MAX_METRICS_PER_RUN) {
-      hide_detail_loading();
-    }
+    buf_slot->state = SLOT_READY;
+
+    // Refresh display (will show this metric if it's the current page)
+    on_current_metric_ready();
   }
 }
 

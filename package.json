@@ -32,7 +32,9 @@
       "METRIC_NAME",
       "METRIC_VALUE",
       "METRIC_HISTORY",
-      "METRICS_COUNT"
+      "METRICS_COUNT",
+      "FETCH_METRIC_INDEX",
+      "METRIC_INDEX"
     ],
     "resources": {
       "media": [

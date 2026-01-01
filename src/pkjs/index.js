@@ -239,42 +239,30 @@ function packInt64Array(values) {
   return result;
 }
 
-function sendMetricsToWatch(metrics) {
-  if (metrics.length === 0) {
-    Pebble.sendAppMessage({ 'METRICS_COUNT': 0 }, function () {}, function (err) {
-      console.log('Failed to send empty metrics count: ' + JSON.stringify(err));
-    });
+// Send a single metric with its index
+function sendSingleMetric(metrics, metricIndex) {
+  if (metricIndex >= metrics.length) {
+    console.log('Metric index ' + metricIndex + ' out of bounds (total: ' + metrics.length + ')');
     return;
   }
 
-  var index = 0;
+  var metric = metrics[metricIndex];
+  var message = {
+    'METRIC_NAME': metric.name,
+    'METRIC_VALUE': metric.value,
+    'METRIC_INDEX': metricIndex,
+    'METRICS_COUNT': metrics.length
+  };
 
-  function sendNext() {
-    if (index >= metrics.length) return;
-
-    var metric = metrics[index];
-    var message = {
-      'METRIC_NAME': metric.name,
-      'METRIC_VALUE': metric.value
-    };
-
-    if (metric.history && metric.history.length > 0) {
-      message['METRIC_HISTORY'] = packInt64Array(metric.history);
-    }
-
-    if (index === 0) {
-      message['METRICS_COUNT'] = metrics.length;
-    }
-
-    Pebble.sendAppMessage(message, function () {
-      index++;
-      sendNext();
-    }, function (err) {
-      console.log('Failed to send metric: ' + JSON.stringify(err));
-    });
+  if (metric.history && metric.history.length > 0) {
+    message['METRIC_HISTORY'] = packInt64Array(metric.history);
   }
 
-  sendNext();
+  Pebble.sendAppMessage(message, function () {
+    console.log('Sent metric ' + metricIndex + ': ' + metric.name);
+  }, function (err) {
+    console.log('Failed to send metric ' + metricIndex + ': ' + JSON.stringify(err));
+  });
 }
 
 function processRunMetrics(data) {
@@ -372,8 +360,13 @@ Pebble.addEventListener('ready', function () {
 
 Pebble.addEventListener('appmessage', function (e) {
   var runIndex = e.payload['FETCH_RUN_INDEX'];
-  if (runIndex !== undefined && runIndex !== null) {
+  var metricIndex = e.payload['FETCH_METRIC_INDEX'];
+
+  if (runIndex !== undefined && runIndex !== null && metricIndex !== undefined && metricIndex !== null) {
     var runInfo = cachedRuns[runIndex];
+    console.log('Fetching metric ' + metricIndex + ' for run ' + runIndex);
+
+    // Fetch fresh from API (no caching)
     cachedClient.fetchRunMetrics(runInfo.entity, runInfo.project, runInfo.run.name, function (err, data) {
       if (err) {
         console.log('Error fetching metrics: ' + JSON.stringify(err));
@@ -381,7 +374,7 @@ Pebble.addEventListener('appmessage', function (e) {
       }
 
       var metrics = processRunMetrics(data);
-      sendMetricsToWatch(metrics);
+      sendSingleMetric(metrics, metricIndex);
     });
   }
 });
