@@ -89,3 +89,7 @@ Key Entry Points:
 ## AI Code Review Guidelines
 
 - Once you think you've fulfilled the user's request, ask yourself if you see any issues with the current screenshot, and if there are any differences between the screenshot and the reference image or the user's description. If so, fix them.
+
+## Code Style Rules
+
+- NEVER use empty string placeholders ("") or other empty data placeholders where they can be avoided. If something needs to be hidden, draw over it or use proper visibility controls - don't clear data.

@@ -366,6 +366,7 @@ static void update_detail_text(void) {
 
   // Only update text when metric is loaded - skeleton draws on top otherwise
   if (metric) {
+    layer_set_hidden(text_layer_get_layer(s_detail.value_layer), false);
     text_layer_set_text(s_detail.value_layer, metric->value);
     to_uppercase(metric->name, s_name_buffer, sizeof(s_name_buffer));
     text_layer_set_text(s_detail.name_layer, s_name_buffer);
@@ -706,13 +707,18 @@ static Animation *create_scroll_animation(ScrollDirection direction, const char 
   Animation *graph_anim = create_layer_slide_animation(
     s_detail.graph_layer, &s_detail.graph_frame, direction, NULL);
 
-  // If both old and new metrics are loaded, animate value interpolation
+  // Only animate value interpolation when both old and new metrics are loaded
   if (metric && old_value) {
     Animation *value_anim = create_value_interpolation_animation(old_value, metric->value);
     return animation_spawn_create(value_anim, name_anim, graph_anim, NULL);
   }
 
-  // Otherwise just slide name/graph (skeleton will cover value area)
+  // Skeleton to skeleton - hide stale value from previously loaded metric
+  if (!metric && !old_value) {
+    layer_set_hidden(text_layer_get_layer(s_detail.value_layer), true);
+  }
+
+  // Scrolling to/from skeleton - just slide name/graph, no value interpolation
   return animation_spawn_create(name_anim, graph_anim, NULL);
 }
 
