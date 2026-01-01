@@ -25,7 +25,7 @@
 #define WIGGLE_ANIM_DURATION 300
 #define REQUEST_DEBOUNCE_MS 300
 #define REQUEST_STAGGER_MS 100
-#define REFRESH_INTERVAL_MS 10000
+#define REFRESH_INTERVAL_MS 30000
 
 // Fixed-point arithmetic for value interpolation (4 decimal places)
 #define FIXED_POINT_SCALE 10000
