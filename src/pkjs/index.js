@@ -6,6 +6,12 @@ var clay = new Clay(clayConfig);
 var cachedRuns = [];
 var cachedClient = null;
 
+// Cache for sorted metric names (NOT values - those are fetched fresh)
+var cachedMetricNames = {
+  runKey: null,           // "entity/project/runName"
+  names: []               // Array of metric names in sorted order
+};
+
 function base64Encode(str) {
   var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
   var output = '';
@@ -112,9 +118,9 @@ WandbClient.prototype.fetchAllRuns = function (callback) {
   });
 };
 
-WandbClient.prototype.fetchRunMetrics = function (entity, project, runName, callback) {
-  var self = this;
-  var infoQuery = 'query($entity: String!, $project: String!, $runName: String!) { ' +
+// Fetch only metric names (for sorting/caching) - lightweight call
+WandbClient.prototype.fetchMetricNames = function (entity, project, runName, callback) {
+  var query = 'query($entity: String!, $project: String!, $runName: String!) { ' +
     'project(name: $project, entityName: $entity) { ' +
       'run(name: $runName) { ' +
         'summaryMetrics historyKeys ' +
@@ -122,47 +128,103 @@ WandbClient.prototype.fetchRunMetrics = function (entity, project, runName, call
     '} ' +
   '}';
 
-  this.request(infoQuery, { entity: entity, project: project, runName: runName }, function(err, data) {
+  this.request(query, { entity: entity, project: project, runName: runName }, function(err, data) {
     if (err) return callback(err, null);
 
     var run = data.project.run;
-    var allKeys = Object.keys(run.historyKeys.keys).filter(function(k) {
-      return k.charAt(0) !== '_' && k.indexOf('system/') !== 0;
-    });
+    var summary = JSON.parse(run.summaryMetrics);
+    var historyKeysAvailable = run.historyKeys && run.historyKeys.keys
+      ? Object.keys(run.historyKeys.keys)
+      : [];
 
-    // Create separate specs for each metric to get proper sampling per metric
-    var specs = allKeys.map(function(key) {
-      return JSON.stringify({ keys: ['_step', key], samples: 20 });
-    });
+    // Build list of metric names with metadata for sorting
+    var metrics = [];
+    var keys = Object.keys(summary);
 
-    console.log('Fetching ' + specs.length + ' metric histories');
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      if (key.charAt(0) === '_') continue;
+      if (typeof summary[key] !== 'number') continue;
 
-    var historyQuery = 'query($entity: String!, $project: String!, $runName: String!, $specs: [JSONString!]!) { ' +
-      'project(name: $project, entityName: $entity) { ' +
-        'run(name: $runName) { ' +
-          'sampledHistory(specs: $specs) ' +
-        '} ' +
-      '} ' +
-    '}';
+      var hasHistory = historyKeysAvailable.indexOf(key) !== -1 &&
+                       key.indexOf('system/') !== 0;
 
-    self.request(historyQuery, { entity: entity, project: project, runName: runName, specs: specs }, function(err2, historyData) {
-      if (err2) return callback(err2, null);
+      metrics.push({ name: key, hasHistory: hasHistory });
+    }
 
-      // Merge all spec results into a single history keyed by metric
-      var historyByKey = {};
-      var sampledHistory = historyData.project.run.sampledHistory;
+    // Sort: loss/accuracy priority, then by history availability, then alphabetically
+    var priorities = ['loss', 'accuracy'];
 
-      for (var i = 0; i < allKeys.length; i++) {
-        var key = allKeys[i];
-        var rows = sampledHistory[i];
-        if (rows && rows.length > 0) {
-          historyByKey[key] = rows;
-          console.log('Key ' + key + ' has ' + rows.length + ' points');
-        }
+    function getPriority(name) {
+      var lower = name.toLowerCase();
+      for (var j = 0; j < priorities.length; j++) {
+        if (lower.indexOf(priorities[j]) !== -1) return j;
       }
+      return priorities.length;
+    }
 
-      callback(null, { project: { run: { summaryMetrics: run.summaryMetrics, historyByKey: historyByKey } } });
+    metrics.sort(function(a, b) {
+      var aPriority = getPriority(a.name);
+      var bPriority = getPriority(b.name);
+      if (aPriority !== bPriority) return aPriority - bPriority;
+
+      var aHasHistory = a.hasHistory ? 0 : 1;
+      var bHasHistory = b.hasHistory ? 0 : 1;
+      if (aHasHistory !== bHasHistory) return aHasHistory - bHasHistory;
+
+      return a.name < b.name ? -1 : 1;
     });
+
+    // Return just the sorted names
+    var sortedNames = metrics.map(function(m) { return m.name; });
+    callback(null, sortedNames);
+  });
+};
+
+// Fetch a single metric's current value and history
+WandbClient.prototype.fetchSingleMetric = function (entity, project, runName, metricName, callback) {
+  var specs = [JSON.stringify({ keys: ['_step', metricName], samples: 20 })];
+
+  var query = 'query($entity: String!, $project: String!, $runName: String!, $specs: [JSONString!]!) { ' +
+    'project(name: $project, entityName: $entity) { ' +
+      'run(name: $runName) { ' +
+        'summaryMetrics sampledHistory(specs: $specs) ' +
+      '} ' +
+    '} ' +
+  '}';
+
+  this.request(query, { entity: entity, project: project, runName: runName, specs: specs }, function(err, data) {
+    if (err) return callback(err, null);
+
+    var run = data.project.run;
+    var summary = JSON.parse(run.summaryMetrics);
+    var value = summary[metricName];
+
+    // Format value for display
+    var displayValue;
+    if (value === undefined || value === null) {
+      displayValue = '---';
+    } else if (Math.abs(value) >= 1000) {
+      displayValue = value.toFixed(0);
+    } else if (Math.abs(value) >= 1) {
+      displayValue = value.toFixed(2);
+    } else {
+      displayValue = value.toFixed(4);
+    }
+
+    // Parse history
+    var sampledHistory = run.sampledHistory;
+    var rows = sampledHistory[0] || [];
+    var history = [];
+
+    for (var j = 0; j < rows.length; j++) {
+      var val = rows[j][metricName];
+      if (val !== undefined && val !== null) {
+        history.push(toFixedPoint(val));
+      }
+    }
+
+    callback(null, { name: metricName, value: displayValue, history: history });
   });
 };
 
@@ -239,19 +301,13 @@ function packInt64Array(values) {
   return result;
 }
 
-// Send a single metric with its index
-function sendSingleMetric(metrics, metricIndex) {
-  if (metricIndex >= metrics.length) {
-    console.log('Metric index ' + metricIndex + ' out of bounds (total: ' + metrics.length + ')');
-    return;
-  }
-
-  var metric = metrics[metricIndex];
+// Send a single metric to the watch
+function sendMetricToWatch(metric, metricIndex, totalCount) {
   var message = {
     'METRIC_NAME': metric.name,
     'METRIC_VALUE': metric.value,
     'METRIC_INDEX': metricIndex,
-    'METRICS_COUNT': metrics.length
+    'METRICS_COUNT': totalCount
   };
 
   if (metric.history && metric.history.length > 0) {
@@ -265,73 +321,42 @@ function sendSingleMetric(metrics, metricIndex) {
   });
 }
 
-function processRunMetrics(data) {
-  var run = data.project.run;
-  var metrics = [];
+// Fetch and send a metric by index (uses cached names if available)
+function fetchAndSendMetric(runInfo, metricIndex) {
+  var runKey = runInfo.entity + '/' + runInfo.project + '/' + runInfo.run.name;
 
-  var summary = JSON.parse(run.summaryMetrics);
-  var historyByKey = run.historyByKey;
-
-  var keys = Object.keys(summary);
-  for (var i = 0; i < keys.length; i++) {
-    var key = keys[i];
-
-    if (key.charAt(0) === '_') continue;
-
-    var value = summary[key];
-
-    if (typeof value !== 'number') continue;
-
-    var displayValue;
-    if (Math.abs(value) >= 1000) {
-      displayValue = value.toFixed(0);
-    } else if (Math.abs(value) >= 1) {
-      displayValue = value.toFixed(2);
-    } else {
-      displayValue = value.toFixed(4);
+  function doFetch(names) {
+    if (metricIndex >= names.length) {
+      console.log('Metric index ' + metricIndex + ' out of bounds (total: ' + names.length + ')');
+      return;
     }
 
-    var history = [];
-    var rows = historyByKey[key];
-    if (rows) {
-      for (var j = 0; j < rows.length; j++) {
-        var val = rows[j][key];
-        if (val !== undefined && val !== null) {
-          history.push(toFixedPoint(val));
-        }
+    var metricName = names[metricIndex];
+    cachedClient.fetchSingleMetric(runInfo.entity, runInfo.project, runInfo.run.name, metricName, function(err, metric) {
+      if (err) {
+        console.log('Error fetching metric: ' + JSON.stringify(err));
+        return;
       }
-    }
-
-    metrics.push({
-      name: key,
-      value: displayValue,
-      history: history
+      sendMetricToWatch(metric, metricIndex, names.length);
     });
   }
 
-  var priorities = ['loss', 'accuracy'];
-
-  function getPriority(name) {
-    var lower = name.toLowerCase();
-    for (var i = 0; i < priorities.length; i++) {
-      if (lower.indexOf(priorities[i]) !== -1) return i;
-    }
-    return priorities.length;
+  // Check if we have cached names for this run
+  if (cachedMetricNames.runKey === runKey) {
+    doFetch(cachedMetricNames.names);
+  } else {
+    // Need to fetch names first
+    cachedClient.fetchMetricNames(runInfo.entity, runInfo.project, runInfo.run.name, function(err, names) {
+      if (err) {
+        console.log('Error fetching metric names: ' + JSON.stringify(err));
+        return;
+      }
+      // Cache the names
+      cachedMetricNames.runKey = runKey;
+      cachedMetricNames.names = names;
+      doFetch(names);
+    });
   }
-
-  metrics.sort(function(a, b) {
-    var aPriority = getPriority(a.name);
-    var bPriority = getPriority(b.name);
-    if (aPriority !== bPriority) return aPriority - bPriority;
-
-    var aHasHistory = a.history.length > 0 ? 0 : 1;
-    var bHasHistory = b.history.length > 0 ? 0 : 1;
-    if (aHasHistory !== bHasHistory) return aHasHistory - bHasHistory;
-
-    return a.name < b.name ? -1 : 1;
-  });
-
-  return metrics;
 }
 
 Pebble.addEventListener('ready', function () {
@@ -365,16 +390,6 @@ Pebble.addEventListener('appmessage', function (e) {
   if (runIndex !== undefined && runIndex !== null && metricIndex !== undefined && metricIndex !== null) {
     var runInfo = cachedRuns[runIndex];
     console.log('Fetching metric ' + metricIndex + ' for run ' + runIndex);
-
-    // Fetch fresh from API (no caching)
-    cachedClient.fetchRunMetrics(runInfo.entity, runInfo.project, runInfo.run.name, function (err, data) {
-      if (err) {
-        console.log('Error fetching metrics: ' + JSON.stringify(err));
-        return;
-      }
-
-      var metrics = processRunMetrics(data);
-      sendSingleMetric(metrics, metricIndex);
-    });
+    fetchAndSendMetric(runInfo, metricIndex);
   }
 });
