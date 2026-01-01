@@ -1,3 +1,5 @@
+# Wrist & Biases
+
 ![Wrist & Biases](resources/banner.png)
 
 Monitor your [Weights & Biases](https://wandb.ai) ML training runs from your Pebble smartwatch.

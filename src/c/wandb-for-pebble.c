@@ -25,6 +25,7 @@
 #define WIGGLE_ANIM_DURATION 300
 #define REQUEST_DEBOUNCE_MS 300
 #define REQUEST_STAGGER_MS 100
+#define REFRESH_INTERVAL_MS 10000
 
 // Fixed-point arithmetic for value interpolation (4 decimal places)
 #define FIXED_POINT_SCALE 10000
@@ -232,6 +233,9 @@ static AppTimer *s_request_current_timer = NULL;
 static AppTimer *s_request_next_timer = NULL;
 static AppTimer *s_request_prev_timer = NULL;
 
+// Timer for periodic metric refresh
+static AppTimer *s_refresh_timer = NULL;
+
 static void cancel_all_request_timers(void) {
   if (s_request_current_timer) {
     app_timer_cancel(s_request_current_timer);
@@ -284,6 +288,40 @@ static void request_adjacent_metrics(void) {
 
   // Previous metric: after next has time to send
   s_request_prev_timer = app_timer_register(REQUEST_DEBOUNCE_MS + REQUEST_STAGGER_MS * 2, do_request_prev, NULL);
+}
+
+// Refresh current metric without changing slot state (no skeleton shown)
+static void refresh_current_metric(void) {
+  // Only refresh if current metric is already loaded
+  WandbMetric *metric = get_current_metric();
+  if (!metric) return;
+
+  DictionaryIterator *iter;
+  AppMessageResult result = app_message_outbox_begin(&iter);
+  if (result != APP_MSG_OK) return;
+
+  dict_write_uint8(iter, MESSAGE_KEY_FETCH_RUN_INDEX, s_ui.selected_run_index);
+  dict_write_uint8(iter, MESSAGE_KEY_FETCH_METRIC_INDEX, s_ui.current_metric_page);
+  app_message_outbox_send();
+}
+
+static void refresh_timer_callback(void *context) {
+  s_refresh_timer = NULL;
+
+  // Only refresh if detail window is open
+  if (!s_detail.window) return;
+
+  refresh_current_metric();
+
+  // Schedule next refresh
+  s_refresh_timer = app_timer_register(REFRESH_INTERVAL_MS, refresh_timer_callback, NULL);
+}
+
+static void restart_refresh_timer(void) {
+  if (s_refresh_timer) {
+    app_timer_cancel(s_refresh_timer);
+  }
+  s_refresh_timer = app_timer_register(REFRESH_INTERVAL_MS, refresh_timer_callback, NULL);
 }
 
 static int32_t lerp_fixed(int32_t from, int32_t to, AnimationProgress progress) {
@@ -750,6 +788,9 @@ static void do_scroll(ScrollDirection direction) {
 
     // Request adjacent metrics for the new position
     request_adjacent_metrics();
+
+    // Restart refresh timer for the new metric
+    restart_refresh_timer();
   }
 
   if (s_detail.scroll_animation) {
@@ -1106,12 +1147,21 @@ static void detail_window_load(Window *window) {
   s_detail.scroll_animation = NULL;
   s_scrub.active = false;
 
+  // Start refresh timer for live updates
+  restart_refresh_timer();
+
   // Update display (will show skeleton if metric not loaded)
   update_detail_text();
 }
 
 static void detail_window_unload(Window *window) {
   s_scrub.active = false;
+
+  // Cancel refresh timer
+  if (s_refresh_timer) {
+    app_timer_cancel(s_refresh_timer);
+    s_refresh_timer = NULL;
+  }
 
   if (s_detail.scroll_animation) {
     animation_unschedule(s_detail.scroll_animation);
