@@ -1,34 +1,38 @@
 #include <pebble.h>
 
-// Constants and Data Structures
-#define MAX_RUNS 10
-#define MAX_NAME_LENGTH 32
-#define MAX_VALUE_LENGTH 16
-#define MAX_HISTORY_POINTS 20
-#define METRIC_BUFFER_SIZE 3
+// Data storage limits
+#define MAX_WANDB_RUNS 10
+#define MAX_RUN_NAME_CHARS 32
+#define MAX_METRIC_VALUE_CHARS 16
+#define MAX_GRAPH_HISTORY_POINTS 20
+#define METRIC_SLIDING_BUFFER_SLOTS 3
 
-#define PADDING_LEFT 10
-#define ANIM_DURATION 200
-#define ANIM_SLIDE_DISTANCE 15
+// Layout constants
+#define CONTENT_LEFT_PADDING 10
 #define STATUS_BAR_HEIGHT 16
 
-// Graph drawing constants
-#define GRAPH_MARGIN 2
-#define GRAPH_PADDING 4
-#define INDICATOR_SIZE 10
-#define DATA_POINT_SIZE 3
+// Scroll transition animation
+#define SCROLL_ANIM_DURATION_MS 200
+#define SCROLL_ANIM_SLIDE_PIXELS 15
 
-// Animation timing constants
-#define SCRUB_FIXED_SCALE 1000
-#define SCRUB_ANIM_DURATION 100
-#define SCRUB_REPEAT_INTERVAL 150
-#define WIGGLE_ANIM_DURATION 300
-#define REQUEST_DEBOUNCE_MS 300
-#define REQUEST_STAGGER_MS 100
-#define REFRESH_INTERVAL_MS 30000
+// Graph visual dimensions
+#define GRAPH_OUTER_MARGIN 5
+#define GRAPH_CURRENT_INDICATOR_SIZE 10
+#define GRAPH_DATA_POINT_SIZE 3
+
+// Scrub mode (history navigation) timing
+#define SCRUB_POSITION_SCALE 1000
+#define SCRUB_STEP_ANIM_MS 100
+#define SCRUB_BUTTON_REPEAT_MS 150
+#define SCRUB_WIGGLE_ANIM_MS 300
+
+// Network request timing
+#define METRIC_REQUEST_DEBOUNCE_MS 300
+#define ADJACENT_METRIC_STAGGER_MS 500
+#define METRIC_AUTO_REFRESH_MS 30000
 
 // Fixed-point arithmetic for value interpolation (4 decimal places)
-#define FIXED_POINT_SCALE 10000
+#define VALUE_INTERPOLATION_SCALE 10000
 
 typedef enum {
   ScrollDirectionUp,
@@ -36,9 +40,9 @@ typedef enum {
 } ScrollDirection;
 
 typedef struct {
-  char name[MAX_NAME_LENGTH];
-  char value[MAX_VALUE_LENGTH];
-  int64_t history[MAX_HISTORY_POINTS];  // Fixed-point historical values (64-bit)
+  char name[MAX_RUN_NAME_CHARS];
+  char value[MAX_METRIC_VALUE_CHARS];
+  int64_t history[MAX_GRAPH_HISTORY_POINTS];  // Fixed-point historical values (64-bit)
   uint8_t history_count;
 } WandbMetric;
 
@@ -58,21 +62,21 @@ typedef struct {
 
 // The 3-slot sliding window buffer
 typedef struct {
-  MetricBufferSlot slots[METRIC_BUFFER_SIZE];
+  MetricBufferSlot slots[METRIC_SLIDING_BUFFER_SLOTS];
 } MetricBuffer;
 
 #define MAX_STATE_LENGTH 16
 
 typedef struct {
-  char run_name[MAX_NAME_LENGTH];
-  char project_name[MAX_NAME_LENGTH];
+  char run_name[MAX_RUN_NAME_CHARS];
+  char project_name[MAX_RUN_NAME_CHARS];
   char state[MAX_STATE_LENGTH];
   uint8_t total_metrics;  // Total number of metrics for this run
 } WandbRun;
 
 // App data (persistent)
 typedef struct {
-  WandbRun runs[MAX_RUNS];
+  WandbRun runs[MAX_WANDB_RUNS];
   uint8_t num_runs;
 } WandbData;
 
@@ -116,7 +120,7 @@ typedef struct {
   int32_t from_index_fixed;
   int32_t to_index_fixed;
   Animation *animation;
-  char value_buffer[MAX_VALUE_LENGTH];
+  char value_buffer[MAX_METRIC_VALUE_CHARS];
   AppTimer *repeat_timer;
   int repeat_direction;
   // Bounce/wiggle animation params
@@ -131,7 +135,7 @@ typedef struct {
   int32_t from;
   int32_t to;
   int decimals;
-  char buffer[MAX_VALUE_LENGTH];
+  char buffer[MAX_METRIC_VALUE_CHARS];
 } ValueAnimState;
 
 // Static Variables
@@ -148,7 +152,7 @@ static uint8_t s_expected_runs_count;
 #if !defined(PBL_ROUND)
 static char s_page_buffer[16];
 #endif
-static char s_name_buffer[MAX_NAME_LENGTH];
+static char s_name_buffer[MAX_RUN_NAME_CHARS];
 
 // Helper Functions
 static inline void mark_graph_dirty(void) {
@@ -157,7 +161,7 @@ static inline void mark_graph_dirty(void) {
 
 // Buffer management functions
 static void metric_buffer_init(void) {
-  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+  for (int i = 0; i < METRIC_SLIDING_BUFFER_SLOTS; i++) {
     s_metric_buffer.slots[i].metric_id = -1;
     s_metric_buffer.slots[i].state = SLOT_EMPTY;
   }
@@ -169,7 +173,7 @@ static void metric_buffer_clear(void) {
 
 // Get metric from buffer by ID, returns NULL if not ready
 static WandbMetric* get_metric_from_buffer(uint8_t metric_id) {
-  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+  for (int i = 0; i < METRIC_SLIDING_BUFFER_SLOTS; i++) {
     if (s_metric_buffer.slots[i].metric_id == metric_id &&
         s_metric_buffer.slots[i].state == SLOT_READY) {
       return &s_metric_buffer.slots[i].metric;
@@ -185,7 +189,7 @@ static WandbMetric* get_current_metric(void) {
 
 // Check if a metric is in the buffer (any state except EMPTY)
 static bool is_metric_in_buffer(uint8_t metric_id) {
-  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+  for (int i = 0; i < METRIC_SLIDING_BUFFER_SLOTS; i++) {
     if (s_metric_buffer.slots[i].metric_id == metric_id &&
         s_metric_buffer.slots[i].state != SLOT_EMPTY) {
       return true;
@@ -197,14 +201,14 @@ static bool is_metric_in_buffer(uint8_t metric_id) {
 // Find best slot for a new metric (LRU-like based on distance from current page)
 static int8_t find_slot_for_metric(uint8_t metric_id) {
   // First, check if already assigned
-  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+  for (int i = 0; i < METRIC_SLIDING_BUFFER_SLOTS; i++) {
     if (s_metric_buffer.slots[i].metric_id == metric_id) {
       return i;
     }
   }
 
   // Find empty slot
-  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+  for (int i = 0; i < METRIC_SLIDING_BUFFER_SLOTS; i++) {
     if (s_metric_buffer.slots[i].state == SLOT_EMPTY) {
       return i;
     }
@@ -213,7 +217,7 @@ static int8_t find_slot_for_metric(uint8_t metric_id) {
   // Replace the slot furthest from current page
   int max_distance = -1;
   int8_t furthest = 0;
-  for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+  for (int i = 0; i < METRIC_SLIDING_BUFFER_SLOTS; i++) {
     int distance = s_metric_buffer.slots[i].metric_id >= s_ui.current_metric_page
       ? s_metric_buffer.slots[i].metric_id - s_ui.current_metric_page
       : s_ui.current_metric_page - s_metric_buffer.slots[i].metric_id;
@@ -281,13 +285,13 @@ static void request_adjacent_metrics(void) {
   cancel_all_request_timers();
 
   // Current metric: after short debounce (in case of rapid scrolling)
-  s_request_current_timer = app_timer_register(REQUEST_DEBOUNCE_MS, do_request_current, NULL);
+  s_request_current_timer = app_timer_register(METRIC_REQUEST_DEBOUNCE_MS, do_request_current, NULL);
 
   // Next metric: after current has time to send
-  s_request_next_timer = app_timer_register(REQUEST_DEBOUNCE_MS + REQUEST_STAGGER_MS, do_request_next, NULL);
+  s_request_next_timer = app_timer_register(METRIC_REQUEST_DEBOUNCE_MS + ADJACENT_METRIC_STAGGER_MS, do_request_next, NULL);
 
   // Previous metric: after next has time to send
-  s_request_prev_timer = app_timer_register(REQUEST_DEBOUNCE_MS + REQUEST_STAGGER_MS * 2, do_request_prev, NULL);
+  s_request_prev_timer = app_timer_register(METRIC_REQUEST_DEBOUNCE_MS + ADJACENT_METRIC_STAGGER_MS * 2, do_request_prev, NULL);
 }
 
 // Refresh current metric without changing slot state (no skeleton shown)
@@ -314,14 +318,14 @@ static void refresh_timer_callback(void *context) {
   refresh_current_metric();
 
   // Schedule next refresh
-  s_refresh_timer = app_timer_register(REFRESH_INTERVAL_MS, refresh_timer_callback, NULL);
+  s_refresh_timer = app_timer_register(METRIC_AUTO_REFRESH_MS, refresh_timer_callback, NULL);
 }
 
 static void restart_refresh_timer(void) {
   if (s_refresh_timer) {
     app_timer_cancel(s_refresh_timer);
   }
-  s_refresh_timer = app_timer_register(REFRESH_INTERVAL_MS, refresh_timer_callback, NULL);
+  s_refresh_timer = app_timer_register(METRIC_AUTO_REFRESH_MS, refresh_timer_callback, NULL);
 }
 
 static int32_t lerp_fixed(int32_t from, int32_t to, AnimationProgress progress) {
@@ -442,12 +446,12 @@ static ValueRange calculate_value_range(const int64_t *values, uint8_t count) {
 
 static void calculate_graph_points(GPoint *points, const int64_t *history,
     uint8_t count, GRect bounds, ValueRange range) {
-  int16_t graph_height = bounds.size.h - GRAPH_PADDING;
-  int16_t graph_width = bounds.size.w - GRAPH_PADDING;
+  int16_t graph_height = bounds.size.h - GRAPH_OUTER_MARGIN * 2;
+  int16_t graph_width = bounds.size.w - GRAPH_OUTER_MARGIN * 2;
 
   for (int i = 0; i < count; i++) {
-    int16_t x = GRAPH_MARGIN + (i * graph_width) / (count - 1);
-    int16_t y = GRAPH_MARGIN + graph_height - ((history[i] - range.min) * graph_height / range.range);
+    int16_t x = GRAPH_OUTER_MARGIN + (i * graph_width) / (count - 1);
+    int16_t y = GRAPH_OUTER_MARGIN + graph_height - ((history[i] - range.min) * graph_height / range.range);
     points[i] = GPoint(x, y);
   }
 }
@@ -459,7 +463,7 @@ static void draw_data_points(GContext *ctx, const GPoint *points, uint8_t count)
     graphics_context_set_fill_color(ctx, GColorBlack);
   #endif
   for (int i = 0; i < count; i++) {
-    graphics_fill_rect(ctx, GRect(points[i].x - 1, points[i].y - 1, DATA_POINT_SIZE, DATA_POINT_SIZE), 0, GCornerNone);
+    graphics_fill_rect(ctx, GRect(points[i].x - 1, points[i].y - 1, GRAPH_DATA_POINT_SIZE, GRAPH_DATA_POINT_SIZE), 0, GCornerNone);
   }
 }
 
@@ -472,8 +476,8 @@ static void draw_line_graph(GContext *ctx, const GPoint *points, uint8_t count) 
 }
 
 static GPoint interpolate_indicator_position(const GPoint *points, uint8_t count, int32_t index_fixed) {
-  int idx_int = index_fixed / SCRUB_FIXED_SCALE;
-  int32_t frac = index_fixed % SCRUB_FIXED_SCALE;
+  int idx_int = index_fixed / SCRUB_POSITION_SCALE;
+  int32_t frac = index_fixed % SCRUB_POSITION_SCALE;
 
   // Clamp to valid range
   if (idx_int < 0) {
@@ -482,7 +486,7 @@ static GPoint interpolate_indicator_position(const GPoint *points, uint8_t count
   }
   if (idx_int >= count - 1) {
     idx_int = count - 2;
-    frac = SCRUB_FIXED_SCALE + (index_fixed - (count - 1) * SCRUB_FIXED_SCALE);
+    frac = SCRUB_POSITION_SCALE + (index_fixed - (count - 1) * SCRUB_POSITION_SCALE);
   }
 
   // Interpolate between adjacent points
@@ -490,15 +494,15 @@ static GPoint interpolate_indicator_position(const GPoint *points, uint8_t count
   int16_t x2 = points[idx_int + 1].x, y2 = points[idx_int + 1].y;
 
   return GPoint(
-    x1 + (int16_t)((x2 - x1) * frac / SCRUB_FIXED_SCALE),
-    y1 + (int16_t)((y2 - y1) * frac / SCRUB_FIXED_SCALE)
+    x1 + (int16_t)((x2 - x1) * frac / SCRUB_POSITION_SCALE),
+    y1 + (int16_t)((y2 - y1) * frac / SCRUB_POSITION_SCALE)
   );
 }
 
 static void draw_indicator(GContext *ctx, GPoint position) {
   graphics_context_set_fill_color(ctx, GColorBlack);
-  int16_t half = INDICATOR_SIZE / 2;
-  graphics_fill_rect(ctx, GRect(position.x - half, position.y - half, INDICATOR_SIZE, INDICATOR_SIZE), 0, GCornerNone);
+  int16_t half = GRAPH_CURRENT_INDICATOR_SIZE / 2;
+  graphics_fill_rect(ctx, GRect(position.x - half, position.y - half, GRAPH_CURRENT_INDICATOR_SIZE, GRAPH_CURRENT_INDICATOR_SIZE), 0, GCornerNone);
 }
 
 static void draw_skeleton_rects(GContext *ctx, GRect graph_bounds) {
@@ -565,7 +569,7 @@ static void graph_layer_update_proc(Layer *layer, GContext *ctx) {
 
   ValueRange range = calculate_value_range(metric->history, metric->history_count);
 
-  GPoint points[MAX_HISTORY_POINTS];
+  GPoint points[MAX_GRAPH_HISTORY_POINTS];
   calculate_graph_points(points, metric->history, metric->history_count, bounds, range);
 
   if (s_scrub.active) {
@@ -623,8 +627,8 @@ static void format_fixed_point(int64_t value, int decimals, char *buffer, size_t
   bool negative = value < 0;
   if (negative) value = -value;
 
-  int64_t integer_part = value / FIXED_POINT_SCALE;
-  int64_t frac_part = value % FIXED_POINT_SCALE;
+  int64_t integer_part = value / VALUE_INTERPOLATION_SCALE;
+  int64_t frac_part = value % VALUE_INTERPOLATION_SCALE;
 
   if (decimals == 0) {
     snprintf(buffer, size, "%s%ld", negative ? "-" : "", (long)integer_part);
@@ -668,7 +672,7 @@ static Animation *create_value_interpolation_animation(const char *from_value, c
 
   Animation *anim = animation_create();
   animation_set_implementation(anim, &s_value_animation_impl);
-  animation_set_duration(anim, ANIM_DURATION);
+  animation_set_duration(anim, SCROLL_ANIM_DURATION_MS);
   animation_set_curve(anim, AnimationCurveEaseInOut);
   return anim;
 }
@@ -698,12 +702,12 @@ static void on_name_outbound_stopped(Animation *animation, bool finished, void *
 // Generic layer slide animation: out and back in from opposite direction
 static Animation *create_layer_slide_animation(Layer *layer, GRect *home_frame,
     ScrollDirection direction, AnimationStoppedHandler on_halfway) {
-  int16_t out_delta = (direction == ScrollDirectionUp) ? ANIM_SLIDE_DISTANCE : -ANIM_SLIDE_DISTANCE;
+  int16_t out_delta = (direction == ScrollDirectionUp) ? SCROLL_ANIM_SLIDE_PIXELS : -SCROLL_ANIM_SLIDE_PIXELS;
 
   GRect out_frame = *home_frame;
   out_frame.origin.y += out_delta;
   PropertyAnimation *anim_out = property_animation_create_layer_frame(layer, NULL, &out_frame);
-  animation_set_duration((Animation *)anim_out, ANIM_DURATION / 2);
+  animation_set_duration((Animation *)anim_out, SCROLL_ANIM_DURATION_MS / 2);
   animation_set_curve((Animation *)anim_out, AnimationCurveEaseIn);
 
   if (on_halfway) {
@@ -713,7 +717,7 @@ static Animation *create_layer_slide_animation(Layer *layer, GRect *home_frame,
   GRect in_frame = *home_frame;
   in_frame.origin.y -= out_delta;
   PropertyAnimation *anim_in = property_animation_create_layer_frame(layer, &in_frame, home_frame);
-  animation_set_duration((Animation *)anim_in, ANIM_DURATION / 2);
+  animation_set_duration((Animation *)anim_in, SCROLL_ANIM_DURATION_MS / 2);
   animation_set_curve((Animation *)anim_in, AnimationCurveEaseOut);
 
   return animation_sequence_create((Animation *)anim_out, (Animation *)anim_in, NULL);
@@ -722,16 +726,16 @@ static Animation *create_layer_slide_animation(Layer *layer, GRect *home_frame,
 // Generic layer bounce animation: out and back to same position
 static Animation *create_layer_bounce_animation(Layer *layer, GRect *home_frame,
     ScrollDirection direction) {
-  int16_t delta = (direction == ScrollDirectionUp) ? ANIM_SLIDE_DISTANCE / 3 : -ANIM_SLIDE_DISTANCE / 3;
+  int16_t delta = (direction == ScrollDirectionUp) ? SCROLL_ANIM_SLIDE_PIXELS / 3 : -SCROLL_ANIM_SLIDE_PIXELS / 3;
 
   GRect bounce_frame = *home_frame;
   bounce_frame.origin.y += delta;
   PropertyAnimation *anim_out = property_animation_create_layer_frame(layer, NULL, &bounce_frame);
-  animation_set_duration((Animation *)anim_out, ANIM_DURATION / 3);
+  animation_set_duration((Animation *)anim_out, SCROLL_ANIM_DURATION_MS / 3);
   animation_set_curve((Animation *)anim_out, AnimationCurveEaseOut);
 
   PropertyAnimation *anim_back = property_animation_create_layer_frame(layer, &bounce_frame, home_frame);
-  animation_set_duration((Animation *)anim_back, ANIM_DURATION / 3);
+  animation_set_duration((Animation *)anim_back, SCROLL_ANIM_DURATION_MS / 3);
   animation_set_curve((Animation *)anim_back, AnimationCurveEaseIn);
 
   return animation_sequence_create((Animation *)anim_out, (Animation *)anim_back, NULL);
@@ -812,11 +816,11 @@ static void update_scrub_value_display_interpolated(int32_t index_fixed) {
 
   // Clamp index to valid range
   if (index_fixed < 0) index_fixed = 0;
-  int32_t max_fixed = (metric->history_count - 1) * SCRUB_FIXED_SCALE;
+  int32_t max_fixed = (metric->history_count - 1) * SCRUB_POSITION_SCALE;
   if (index_fixed > max_fixed) index_fixed = max_fixed;
 
-  int idx_int = index_fixed / SCRUB_FIXED_SCALE;
-  int32_t frac = index_fixed % SCRUB_FIXED_SCALE;
+  int idx_int = index_fixed / SCRUB_POSITION_SCALE;
+  int32_t frac = index_fixed % SCRUB_POSITION_SCALE;
 
   // Interpolate between history values
   int64_t history_value;
@@ -825,7 +829,7 @@ static void update_scrub_value_display_interpolated(int32_t index_fixed) {
   } else {
     int64_t v1 = metric->history[idx_int];
     int64_t v2 = metric->history[idx_int + 1];
-    history_value = v1 + (v2 - v1) * frac / SCRUB_FIXED_SCALE;
+    history_value = v1 + (v2 - v1) * frac / SCRUB_POSITION_SCALE;
   }
 
   int decimals;
@@ -844,12 +848,12 @@ static void scrub_animation_teardown(Animation *animation) {
   s_scrub.current_index_fixed = s_scrub.to_index_fixed;
 
   WandbMetric *metric = get_current_metric();
-  int32_t max_fixed = (metric->history_count - 1) * SCRUB_FIXED_SCALE;
+  int32_t max_fixed = (metric->history_count - 1) * SCRUB_POSITION_SCALE;
 
   if (s_scrub.current_index_fixed < 0) s_scrub.current_index_fixed = 0;
   if (s_scrub.current_index_fixed > max_fixed) s_scrub.current_index_fixed = max_fixed;
 
-  s_scrub.index = s_scrub.current_index_fixed / SCRUB_FIXED_SCALE;
+  s_scrub.index = s_scrub.current_index_fixed / SCRUB_POSITION_SCALE;
   update_scrub_value_display_interpolated(s_scrub.current_index_fixed);
   update_scrub_name_display();
   mark_graph_dirty();
@@ -914,18 +918,18 @@ static void do_scrub(int direction) {
 
   if (target_index < 0 || target_index > max_index) {
     // Bounce at boundary
-    int32_t bounce_amount = SCRUB_FIXED_SCALE / 3;
+    int32_t bounce_amount = SCRUB_POSITION_SCALE / 3;
     s_scrub.from_index_fixed = s_scrub.current_index_fixed;
-    s_scrub.bounce_target = (target_index < 0) ? -bounce_amount : max_index * SCRUB_FIXED_SCALE + bounce_amount;
-    s_scrub.bounce_return = (target_index < 0) ? 0 : max_index * SCRUB_FIXED_SCALE;
-    schedule_scrub_animation(&s_bounce_animation_impl, SCRUB_ANIM_DURATION, AnimationCurveEaseOut);
+    s_scrub.bounce_target = (target_index < 0) ? -bounce_amount : max_index * SCRUB_POSITION_SCALE + bounce_amount;
+    s_scrub.bounce_return = (target_index < 0) ? 0 : max_index * SCRUB_POSITION_SCALE;
+    schedule_scrub_animation(&s_bounce_animation_impl, SCRUB_STEP_ANIM_MS, AnimationCurveEaseOut);
     return;
   }
 
   s_scrub.from_index_fixed = s_scrub.current_index_fixed;
-  s_scrub.to_index_fixed = target_index * SCRUB_FIXED_SCALE;
+  s_scrub.to_index_fixed = target_index * SCRUB_POSITION_SCALE;
   s_scrub.index = target_index;
-  schedule_scrub_animation(&s_scrub_animation_impl, SCRUB_ANIM_DURATION, AnimationCurveEaseInOut);
+  schedule_scrub_animation(&s_scrub_animation_impl, SCRUB_STEP_ANIM_MS, AnimationCurveEaseInOut);
 }
 
 static void wiggle_animation_update(Animation *animation, const AnimationProgress progress) {
@@ -976,15 +980,15 @@ static void enter_scrub_mode(void) {
 
   s_scrub.active = true;
   s_scrub.index = metric->history_count - 1;
-  s_scrub.current_index_fixed = s_scrub.index * SCRUB_FIXED_SCALE;
+  s_scrub.current_index_fixed = s_scrub.index * SCRUB_POSITION_SCALE;
 
   update_scrub_value_display_interpolated(s_scrub.current_index_fixed);
   update_scrub_name_display();
   mark_graph_dirty();
 
   s_scrub.wiggle_start = s_scrub.current_index_fixed;
-  s_scrub.wiggle_amount = SCRUB_FIXED_SCALE;
-  schedule_scrub_animation(&s_wiggle_animation_impl, WIGGLE_ANIM_DURATION, AnimationCurveLinear);
+  s_scrub.wiggle_amount = SCRUB_POSITION_SCALE;
+  schedule_scrub_animation(&s_wiggle_animation_impl, SCRUB_WIGGLE_ANIM_MS, AnimationCurveLinear);
 }
 
 static void exit_scrub_animation_teardown(Animation *animation) {
@@ -1011,15 +1015,15 @@ static void exit_scrub_mode(void) {
 
   WandbMetric *metric = get_current_metric();
   s_scrub.from_index_fixed = s_scrub.current_index_fixed;
-  s_scrub.to_index_fixed = (metric->history_count - 1) * SCRUB_FIXED_SCALE;
-  schedule_scrub_animation(&s_exit_scrub_animation_impl, SCRUB_ANIM_DURATION * 2, AnimationCurveEaseOut);
+  s_scrub.to_index_fixed = (metric->history_count - 1) * SCRUB_POSITION_SCALE;
+  schedule_scrub_animation(&s_exit_scrub_animation_impl, SCRUB_STEP_ANIM_MS * 2, AnimationCurveEaseOut);
 }
 
 // Detail Window - Click Handlers
 static void scrub_repeat_timer_callback(void *data) {
   if (s_scrub.active && s_scrub.repeat_direction != 0) {
     do_scrub(s_scrub.repeat_direction);
-    s_scrub.repeat_timer = app_timer_register(SCRUB_REPEAT_INTERVAL, scrub_repeat_timer_callback, NULL);
+    s_scrub.repeat_timer = app_timer_register(SCRUB_BUTTON_REPEAT_MS, scrub_repeat_timer_callback, NULL);
   } else {
     s_scrub.repeat_timer = NULL;
   }
@@ -1045,7 +1049,7 @@ static void detail_up_down_handler(ClickRecognizerRef recognizer, void *context)
     }
     do_scrub(direction);
     s_scrub.repeat_direction = direction;
-    s_scrub.repeat_timer = app_timer_register(SCRUB_REPEAT_INTERVAL, scrub_repeat_timer_callback, NULL);
+    s_scrub.repeat_timer = app_timer_register(SCRUB_BUTTON_REPEAT_MS, scrub_repeat_timer_callback, NULL);
   } else {
     do_scroll((button == BUTTON_ID_UP) ? ScrollDirectionUp : ScrollDirectionDown);
   }
@@ -1095,7 +1099,7 @@ static void detail_window_load(Window *window) {
     const GTextAlignment text_align = GTextAlignmentCenter;
     const int16_t graph_inset = 10;
   #else
-    const int16_t padding = PADDING_LEFT;
+    const int16_t padding = CONTENT_LEFT_PADDING;
     const int16_t name_y = STATUS_BAR_HEIGHT + padding;
     const int16_t content_width = bounds.size.w - padding * 2;
     const GTextAlignment text_align = GTextAlignmentLeft;
@@ -1121,7 +1125,7 @@ static void detail_window_load(Window *window) {
   // Store frames for animation
   s_detail.name_frame = GRect(padding, name_y, content_width, 22);
   s_detail.value_frame = GRect(padding, value_y, content_width, 32);
-  s_detail.graph_frame = GRect(padding + graph_inset, graph_y, content_width - graph_inset * 2 - padding, graph_height);
+  s_detail.graph_frame = GRect(padding + graph_inset, graph_y, content_width - graph_inset * 2, graph_height);
 
   // Name layer
   s_detail.name_layer = text_layer_create(s_detail.name_frame);
@@ -1306,7 +1310,7 @@ static void main_window_load(Window *window) {
   int16_t content_height = bounds.size.h - STATUS_BAR_HEIGHT;
   int16_t text_height = 96;  // Allow for 3 lines
   int16_t loading_y = STATUS_BAR_HEIGHT + (content_height - text_height) / 2;
-  GRect loading_bounds = GRect(PADDING_LEFT, loading_y, bounds.size.w - PADDING_LEFT * 2, text_height);
+  GRect loading_bounds = GRect(CONTENT_LEFT_PADDING, loading_y, bounds.size.w - CONTENT_LEFT_PADDING * 2, text_height);
   s_main.loading_layer = text_layer_create(loading_bounds);
   text_layer_set_font(s_main.loading_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
   text_layer_set_text(s_main.loading_layer, "Talking with Weights & Biases...");
@@ -1370,14 +1374,14 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
   Tuple *source_tuple = dict_find(iter, MESSAGE_KEY_RUN_OWNER);
   Tuple *state_tuple = dict_find(iter, MESSAGE_KEY_RUN_STATE);
 
-  if (name_tuple && source_tuple && state_tuple && s_data.num_runs < MAX_RUNS) {
+  if (name_tuple && source_tuple && state_tuple && s_data.num_runs < MAX_WANDB_RUNS) {
     WandbRun *run = &s_data.runs[s_data.num_runs];
 
-    strncpy(run->run_name, name_tuple->value->cstring, MAX_NAME_LENGTH - 1);
-    run->run_name[MAX_NAME_LENGTH - 1] = '\0';
+    strncpy(run->run_name, name_tuple->value->cstring, MAX_RUN_NAME_CHARS - 1);
+    run->run_name[MAX_RUN_NAME_CHARS - 1] = '\0';
 
-    strncpy(run->project_name, source_tuple->value->cstring, MAX_NAME_LENGTH - 1);
-    run->project_name[MAX_NAME_LENGTH - 1] = '\0';
+    strncpy(run->project_name, source_tuple->value->cstring, MAX_RUN_NAME_CHARS - 1);
+    run->project_name[MAX_RUN_NAME_CHARS - 1] = '\0';
 
     strncpy(run->state, state_tuple->value->cstring, MAX_STATE_LENGTH - 1);
     run->state[MAX_STATE_LENGTH - 1] = '\0';
@@ -1417,7 +1421,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
 
     // Find the slot for this metric
     int8_t slot = -1;
-    for (int i = 0; i < METRIC_BUFFER_SIZE; i++) {
+    for (int i = 0; i < METRIC_SLIDING_BUFFER_SLOTS; i++) {
       if (s_metric_buffer.slots[i].metric_id == metric_index) {
         slot = i;
         break;
@@ -1433,18 +1437,18 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     MetricBufferSlot *buf_slot = &s_metric_buffer.slots[slot];
     WandbMetric *metric = &buf_slot->metric;
 
-    strncpy(metric->name, metric_name_tuple->value->cstring, MAX_NAME_LENGTH - 1);
-    metric->name[MAX_NAME_LENGTH - 1] = '\0';
+    strncpy(metric->name, metric_name_tuple->value->cstring, MAX_RUN_NAME_CHARS - 1);
+    metric->name[MAX_RUN_NAME_CHARS - 1] = '\0';
 
-    strncpy(metric->value, metric_value_tuple->value->cstring, MAX_VALUE_LENGTH - 1);
-    metric->value[MAX_VALUE_LENGTH - 1] = '\0';
+    strncpy(metric->value, metric_value_tuple->value->cstring, MAX_METRIC_VALUE_CHARS - 1);
+    metric->value[MAX_METRIC_VALUE_CHARS - 1] = '\0';
 
     // Parse history if present (packed int64 array)
     metric->history_count = 0;
     if (metric_history_tuple && metric_history_tuple->length > 0) {
       uint8_t *bytes = metric_history_tuple->value->data;
       uint16_t num_points = metric_history_tuple->length / 8;
-      if (num_points > MAX_HISTORY_POINTS) num_points = MAX_HISTORY_POINTS;
+      if (num_points > MAX_GRAPH_HISTORY_POINTS) num_points = MAX_GRAPH_HISTORY_POINTS;
 
       for (int i = 0; i < num_points; i++) {
         // Little-endian int64
@@ -1462,19 +1466,26 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     }
 
     // Check if current value differs from last history point and add it
+    // Compare at the display precision to avoid false positives from rounding
     if (metric->history_count > 0) {
       int decimals;
       int64_t current_value = (int64_t)parse_fixed_point(metric->value, &decimals);
       int64_t last_history = metric->history[metric->history_count - 1];
 
-      if (current_value != last_history) {
+      // Format both values at the same precision and compare
+      char current_str[MAX_METRIC_VALUE_CHARS];
+      char last_str[MAX_METRIC_VALUE_CHARS];
+      format_fixed_point(current_value, decimals, current_str, sizeof(current_str));
+      format_fixed_point(last_history, decimals, last_str, sizeof(last_str));
+
+      if (strcmp(current_str, last_str) != 0) {
         // Need to add current value to history
-        if (metric->history_count >= MAX_HISTORY_POINTS) {
+        if (metric->history_count >= MAX_GRAPH_HISTORY_POINTS) {
           // At capacity - shift left to make room
-          for (int i = 0; i < MAX_HISTORY_POINTS - 1; i++) {
+          for (int i = 0; i < MAX_GRAPH_HISTORY_POINTS - 1; i++) {
             metric->history[i] = metric->history[i + 1];
           }
-          metric->history[MAX_HISTORY_POINTS - 1] = current_value;
+          metric->history[MAX_GRAPH_HISTORY_POINTS - 1] = current_value;
         } else {
           // Just append
           metric->history[metric->history_count] = current_value;
