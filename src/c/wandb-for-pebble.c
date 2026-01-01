@@ -1208,6 +1208,28 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
         metric->history_count = num_points;
       }
 
+      // Check if current value differs from last history point and add it
+      if (metric->history_count > 0) {
+        int decimals;
+        int64_t current_value = (int64_t)parse_fixed_point(metric->value, &decimals);
+        int64_t last_history = metric->history[metric->history_count - 1];
+
+        if (current_value != last_history) {
+          // Need to add current value to history
+          if (metric->history_count >= MAX_HISTORY_POINTS) {
+            // At capacity - shift left to make room
+            for (int i = 0; i < MAX_HISTORY_POINTS - 1; i++) {
+              metric->history[i] = metric->history[i + 1];
+            }
+            metric->history[MAX_HISTORY_POINTS - 1] = current_value;
+          } else {
+            // Just append
+            metric->history[metric->history_count] = current_value;
+            metric->history_count++;
+          }
+        }
+      }
+
       run->num_metrics++;
     }
 
