@@ -27,9 +27,12 @@
 #define SCRUB_WIGGLE_ANIM_MS 300
 
 // Network request timing
-#define METRIC_REQUEST_DEBOUNCE_MS 300
-#define ADJACENT_METRIC_STAGGER_MS 500
+#define METRIC_REQUEST_DEBOUNCE_MS 500
+#define ADJACENT_METRIC_STAGGER_MS 300
 #define METRIC_AUTO_REFRESH_MS 30000
+
+// Persistent storage keys
+#define PERSIST_KEY_REFRESH_INTERVAL 1
 
 // Fixed-point arithmetic for value interpolation (4 decimal places)
 #define VALUE_INTERPOLATION_SCALE 10000
@@ -239,6 +242,7 @@ static AppTimer *s_request_prev_timer = NULL;
 
 // Timer for periodic metric refresh
 static AppTimer *s_refresh_timer = NULL;
+static uint32_t s_refresh_interval_ms = METRIC_AUTO_REFRESH_MS;
 
 static void cancel_all_request_timers(void) {
   if (s_request_current_timer) {
@@ -315,14 +319,14 @@ static void refresh_timer_callback(void *context) {
   refresh_current_metric();
 
   // Schedule next refresh
-  s_refresh_timer = app_timer_register(METRIC_AUTO_REFRESH_MS, refresh_timer_callback, NULL);
+  s_refresh_timer = app_timer_register(s_refresh_interval_ms, refresh_timer_callback, NULL);
 }
 
 static void restart_refresh_timer(void) {
   if (s_refresh_timer) {
     app_timer_cancel(s_refresh_timer);
   }
-  s_refresh_timer = app_timer_register(METRIC_AUTO_REFRESH_MS, refresh_timer_callback, NULL);
+  s_refresh_timer = app_timer_register(s_refresh_interval_ms, refresh_timer_callback, NULL);
 }
 
 static int32_t lerp_fixed(int32_t from, int32_t to, AnimationProgress progress) {
@@ -1271,9 +1275,10 @@ static void menu_select_callback(MenuLayer *menu_layer, MenuIndex *cell_index, v
   s_ui.selected_run_index = run_index;
   s_ui.current_metric_page = 0;
 
-  // Clear buffer and request initial metrics
+  // Clear buffer and request first metric directly (no debounce needed for initial load)
+  // Adjacent metrics will be requested once we learn total_metrics from the response
   metric_buffer_clear();
-  request_adjacent_metrics();
+  request_metric(s_ui.selected_run_index, 0);
 
   detail_window_push();
 }
@@ -1353,6 +1358,17 @@ static void main_loading_timer_callback(void *data) {
 
 // AppMessage Handling
 static void inbox_received_callback(DictionaryIterator *iter, void *context) {
+  // Check for refresh interval setting from config
+  Tuple *refresh_tuple = dict_find(iter, MESSAGE_KEY_refreshInterval);
+  if (refresh_tuple) {
+    // Clay sends select values as strings, parse to integer
+    uint32_t new_interval = atoi(refresh_tuple->value->cstring);
+    if (new_interval >= 5000) {  // Minimum 5 seconds
+      s_refresh_interval_ms = new_interval;
+      persist_write_int(PERSIST_KEY_REFRESH_INTERVAL, s_refresh_interval_ms);
+    }
+  }
+
   // Check for RUNS_COUNT (sent with first message)
   Tuple *count_tuple = dict_find(iter, MESSAGE_KEY_RUNS_COUNT);
   if (count_tuple) {
@@ -1399,9 +1415,11 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     uint8_t new_total = metrics_count_tuple->value->uint8;
 
     // If we just learned the total, request adjacent metrics
+    // (current metric already arrived with this message)
     if (run->total_metrics == 0 && new_total > 0) {
       run->total_metrics = new_total;
-      request_adjacent_metrics();
+      s_request_next_timer = app_timer_register(ADJACENT_METRIC_STAGGER_MS, do_request_next, NULL);
+      s_request_prev_timer = app_timer_register(ADJACENT_METRIC_STAGGER_MS * 2, do_request_prev, NULL);
     } else {
       run->total_metrics = new_total;
     }
@@ -1504,6 +1522,11 @@ static void inbox_dropped_callback(AppMessageResult reason, void *context) {
 
 // App Lifecycle
 static void prv_init(void) {
+  // Load saved refresh interval
+  if (persist_exists(PERSIST_KEY_REFRESH_INTERVAL)) {
+    s_refresh_interval_ms = persist_read_int(PERSIST_KEY_REFRESH_INTERVAL);
+  }
+
   // Initialize AppMessage
   app_message_register_inbox_received(inbox_received_callback);
   app_message_register_inbox_dropped(inbox_dropped_callback);

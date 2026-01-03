@@ -35,7 +35,8 @@
       "METRIC_HISTORY",
       "METRICS_COUNT",
       "FETCH_METRIC_INDEX",
-      "METRIC_INDEX"
+      "METRIC_INDEX",
+      "refreshInterval"
     ],
     "resources": {
       "media": [

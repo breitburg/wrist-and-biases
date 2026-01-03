@@ -37,6 +37,28 @@
     ]
   },
   {
+    "type": "section",
+    "items": [
+      {
+        "type": "heading",
+        "defaultValue": "Metrics"
+      },
+      {
+        "type": "select",
+        "messageKey": "refreshInterval",
+        "label": "Refresh Interval",
+        "defaultValue": "30000",
+        "options": [
+          { "label": "5 sec.", "value": "5000" },
+          { "label": "30 sec.", "value": "30000" },
+          { "label": "60 sec.", "value": "60000" },
+          { "label": "1 min. 30 sec.", "value": "90000" },
+          { "label": "3 min.", "value": "180000" }
+        ]
+      }
+    ]
+  },
+  {
     "type": "submit",
     "defaultValue": "Save Settings"
   }
