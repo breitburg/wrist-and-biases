@@ -257,10 +257,7 @@ static void cancel_all_request_timers(void) {
 
 static void do_request_current(void *context) {
   s_request_current_timer = NULL;
-  uint8_t current = s_ui.current_metric_page;
-  if (!is_metric_in_buffer(current)) {
-    request_metric(s_ui.selected_run_index, current);
-  }
+  request_metric(s_ui.selected_run_index, s_ui.current_metric_page);
 }
 
 static void do_request_next(void *context) {
